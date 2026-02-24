@@ -31,3 +31,6 @@
 /package/*/apt/repositories/
 /package/*/apt/tmp/
 /package/docker/*.deb
+
+.bundle
+.DS_Store
