@@ -44,6 +44,7 @@ extern "C"
 #include <utils/memutils.h>
 #include <utils/numeric.h>
 #include <utils/snapmgr.h>
+#include <utils/date.h>
 #include <utils/timestamp.h>
 #include <utils/wait_event.h>
 }
@@ -1208,6 +1209,16 @@ class ArrowArrayBuilder<ArrowType, arrow::enable_if_has_c_type<ArrowType>>
 		return DatumGetTimestamp(datum) +
 		       ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY);
 	}
+
+	template <typename TargetArrowType>
+	std::enable_if_t<std::is_same_v<TargetArrowType, arrow::Date32Type>, int32_t>
+	convert_value(Datum datum)
+	{
+		// PG DateADT: days since 2000-01-01. Arrow Date32: days since 1970-01-01.
+		return DatumGetDateADT(datum) +
+		       (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE);
+	}
+
 };
 
 template <typename ArrowType>
@@ -1361,6 +1372,7 @@ ArrowArrayBuilderBase::make(Form_pg_attribute attribute,
 				attribute, iAttribute, builder);
 		case VARCHAROID:
 		case TEXTOID:
+		case BPCHAROID:
 			return std::make_unique<ArrowArrayBuilder<arrow::StringType>>(
 				attribute, iAttribute, builder);
 		case BYTEAOID:
@@ -1368,6 +1380,9 @@ ArrowArrayBuilderBase::make(Form_pg_attribute attribute,
 				attribute, iAttribute, builder);
 		case TIMESTAMPOID:
 			return std::make_unique<ArrowArrayBuilder<arrow::TimestampType>>(
+				attribute, iAttribute, builder);
+		case DATEOID:
+			return std::make_unique<ArrowArrayBuilder<arrow::Date32Type>>(
 				attribute, iAttribute, builder);
 		default:
 			return arrow::Status::NotImplemented("Unsupported PostgreSQL type: ",
@@ -1393,11 +1408,14 @@ ArrowArrayBuilderBase::arrow_type(Form_pg_attribute attribute)
 			return arrow::float64();
 		case VARCHAROID:
 		case TEXTOID:
+		case BPCHAROID:
 			return arrow::utf8();
 		case BYTEAOID:
 			return arrow::binary();
 		case TIMESTAMPOID:
 			return arrow::timestamp(arrow::TimeUnit::MICRO);
+		case DATEOID:
+			return arrow::date32();
 		default:
 			return arrow::Status::NotImplemented("Unsupported PostgreSQL type: ",
 			                                     attribute->atttypid);

@@ -2,16 +2,13 @@
  * substrait_to_query.cpp
  *
  * Converts a serialized Substrait Plan into a PostgreSQL Query* tree.
- * Supports ReadRel + AggregateRel (sufficient for SELECT count(*) FROM t).
+ * Supported: [SortRel?] > [ProjectRel?] > [AggregateRel?] > [ProjectRel?] > [FilterRel?] > ReadRel
+ * ReadRel.filter and ReadRel.projection are also handled.
  *
  * Tested against PostgreSQL 18 + protobuf 3.x.
  *
- * INCLUDE ORDER IS CRITICAL:
- * Protobuf headers must come before PostgreSQL headers.
- * PostgreSQL's c.h defines ERROR=22 and other macros that corrupt
- * protobuf's internal logging tokens (LOGLEVEL_ERROR becomes LOGLEVEL_22).
- * We include protobuf first, then undef the conflicting PG macros,
- * then include PG headers.
+ * INCLUDE ORDER IS CRITICAL — protobuf headers before PG headers.
+ * PG's c.h defines ERROR=22 etc. which corrupt protobuf's logging tokens.
  */
 
 /* --- Step 1: C++ standard library (no conflicts) --- */
@@ -70,9 +67,12 @@ extern "C"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
 #include "parser/parse_relation.h" /* addRTEPermissionInfo */
 #include "parser/parse_oper.h"
+#include "catalog/pg_cast.h"
+#include "datatype/timestamp.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h" /* catclist full definition */
@@ -232,6 +232,18 @@ read_rel_to_rte(const substrait::ReadRel &read,
     return rte;
 }
 
+/* Virtual expression map: field_index → precomputed PG Expr.
+ * Used for inner ProjectRel computed columns. */
+typedef std::unordered_map<int, Expr *> VirtualMap;
+
+/* Forward declaration — defined in Section 5. */
+static Expr *
+convert_expression(const substrait::Expression &expr,
+                   int rtindex,
+                   const SubstraitSchema &schema,
+                   const FuncMap &func_map,
+                   const VirtualMap &virtuals = {});
+
 /* ============================================================
  * SECTION 4 - AggregateRel to targetList
  * ============================================================ */
@@ -299,7 +311,8 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
                             Query *query,
                             int rtindex,
                             const SubstraitSchema &schema,
-                            const FuncMap &func_map)
+                            const FuncMap &func_map,
+                            const VirtualMap &virtuals = {})
 {
     query->hasAggs = true;
 
@@ -334,17 +347,28 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
 
             auto [attnum, typeoid] = schema[field_idx];
 
-            Oid collation = InvalidOid;
-            if (typeoid == TEXTOID || typeoid == VARCHAROID ||
-                typeoid == BPCHAROID)
-                collation = DEFAULT_COLLATION_OID;
-
-            Var *var = makeVar(rtindex, attnum, typeoid, -1, collation, 0);
+            Expr *group_expr;
+            char *attname;
+            auto vit = virtuals.find(field_idx);
+            if (vit != virtuals.end())
+            {
+                group_expr = (Expr *)copyObjectImpl(vit->second);
+                attname = pstrdup("expr");
+            }
+            else
+            {
+                Oid collation = InvalidOid;
+                if (typeoid == TEXTOID || typeoid == VARCHAROID ||
+                    typeoid == BPCHAROID)
+                    collation = DEFAULT_COLLATION_OID;
+                group_expr = (Expr *)makeVar(rtindex, attnum, typeoid,
+                                             -1, collation, 0);
+                attname = get_attname(scan_rte->relid, attnum, false);
+            }
 
             Index sortgroupref = (Index)resno;
-            char *attname = get_attname(scan_rte->relid, attnum, false);
 
-            TargetEntry *tle = makeTargetEntry((Expr *)var, resno++,
+            TargetEntry *tle = makeTargetEntry(group_expr, resno++,
                                                attname, false);
             tle->ressortgroupref = sortgroupref;
             tlist = lappend(tlist, tle);
@@ -383,6 +407,8 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
         bool is_star = (substrait_name == "count_star" ||
                         (pg_agg == "count" && amf.arguments_size() == 0));
 
+        /* Convert arguments once, derive types from converted exprs. */
+        std::vector<Expr *> converted_args;
         std::vector<Oid> argtypes;
         Oid aggfnoid = InvalidOid;
         if (is_star)
@@ -396,28 +422,10 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
                 if (!arg.has_value())
                     ereport(ERROR,
                             (errmsg("substrait: enum/type agg args unsupported")));
-                const auto &expr = arg.value();
-                if (expr.has_selection())
-                {
-                    int idx = expr.selection()
-                                  .direct_reference()
-                                  .struct_field()
-                                  .field();
-                    if (idx < 0 || idx >= (int)schema.size())
-                        ereport(ERROR,
-                                (errmsg("substrait: arg field index %d out of range",
-                                        idx)));
-                    argtypes.push_back(schema[idx].second);
-                }
-                else if (expr.has_literal())
-                {
-                    argtypes.push_back(INT8OID);
-                }
-                else
-                {
-                    ereport(ERROR,
-                            (errmsg("substrait: complex agg arg not supported")));
-                }
+                Expr *e = convert_expression(
+                    arg.value(), rtindex, schema, func_map, virtuals);
+                converted_args.push_back(e);
+                argtypes.push_back(exprType((Node *)e));
             }
             List *funcname = list_make1(makeString(pstrdup(pg_agg.c_str())));
             aggfnoid = LookupFuncName(funcname, (int)argtypes.size(),
@@ -436,19 +444,11 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
         List *aggargtypes = NIL;
         if (!is_star)
         {
-            for (const auto &arg : amf.arguments())
+            for (size_t i = 0; i < converted_args.size(); i++)
             {
-                const auto &expr = arg.value();
-                int idx = expr.selection()
-                              .direct_reference()
-                              .struct_field()
-                              .field();
-                auto [attnum, typeoid] = schema[idx];
-                Var *var = makeVar(rtindex, attnum, typeoid, -1,
-                                   InvalidOid, 0);
                 TargetEntry *arg_tle =
-                    makeTargetEntry((Expr *)var,
-                                    (AttrNumber)(list_length(agg_args) + 1),
+                    makeTargetEntry(converted_args[i],
+                                    (AttrNumber)(i + 1),
                                     NULL, false);
                 agg_args = lappend(agg_args, arg_tle);
             }
@@ -487,7 +487,440 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
 }
 
 /* ============================================================
- * SECTION 5 - Top-level entry point
+ * SECTION 5 - General expression converter
+ *
+ * Converts a substrait Expression into a PG Expr* tree.
+ * Used by FilterRel, AggregateRel args, and ProjectRel expressions.
+ * ============================================================ */
+
+/* Map substrait scalar function names to PG operator symbols. */
+static const std::unordered_map<std::string, const char *> kOpNameMap = {
+    {"gt", ">"},     {"lt", "<"},     {"gte", ">="},   {"lte", "<="},
+    {"equal", "="},  {"not_equal", "<>"},
+    {"add", "+"},    {"subtract", "-"},
+    {"multiply", "*"}, {"divide", "/"},
+};
+
+static Expr *
+convert_expression(const substrait::Expression &expr,
+                   int rtindex,
+                   const SubstraitSchema &schema,
+                   const FuncMap &func_map,
+                   const VirtualMap &virtuals)
+{
+    /* --- FieldReference → Var (or virtual expression) --- */
+    if (expr.has_selection())
+    {
+        const auto &sel = expr.selection();
+        if (!sel.has_direct_reference() ||
+            !sel.direct_reference().has_struct_field())
+            ereport(ERROR,
+                    (errmsg("substrait: unsupported field reference type")));
+
+        int idx = sel.direct_reference().struct_field().field();
+        if (idx < 0 || idx >= (int)schema.size())
+            ereport(ERROR,
+                    (errmsg("substrait: field index %d out of range", idx)));
+
+        /* Virtual column from inner ProjectRel — return copy of stored expr. */
+        auto vit = virtuals.find(idx);
+        if (vit != virtuals.end())
+            return (Expr *)copyObjectImpl(vit->second);
+
+        auto [attnum, typeoid] = schema[idx];
+        Oid collation = InvalidOid;
+        if (typeoid == TEXTOID || typeoid == VARCHAROID ||
+            typeoid == BPCHAROID)
+            collation = DEFAULT_COLLATION_OID;
+
+        return (Expr *)makeVar(rtindex, attnum, typeoid, -1, collation, 0);
+    }
+
+    /* --- Literal → Const --- */
+    if (expr.has_literal())
+    {
+        const auto &lit = expr.literal();
+
+        if (lit.has_boolean())
+            return (Expr *)makeConst(BOOLOID, -1, InvalidOid, 1,
+                                     BoolGetDatum(lit.boolean()),
+                                     false, true);
+        if (lit.has_i8())
+            return (Expr *)makeConst(INT2OID, -1, InvalidOid, 2,
+                                     Int16GetDatum((int16)lit.i8()),
+                                     false, true);
+        if (lit.has_i16())
+            return (Expr *)makeConst(INT2OID, -1, InvalidOid, 2,
+                                     Int16GetDatum((int16)lit.i16()),
+                                     false, true);
+        if (lit.has_i32())
+            return (Expr *)makeConst(INT4OID, -1, InvalidOid, 4,
+                                     Int32GetDatum(lit.i32()),
+                                     false, true);
+        if (lit.has_i64())
+            return (Expr *)makeConst(INT8OID, -1, InvalidOid, 8,
+                                     Int64GetDatum(lit.i64()),
+                                     false, true);
+        if (lit.has_fp32())
+            return (Expr *)makeConst(FLOAT4OID, -1, InvalidOid, 4,
+                                     Float4GetDatum(lit.fp32()),
+                                     false, true);
+        if (lit.has_fp64())
+            return (Expr *)makeConst(FLOAT8OID, -1, InvalidOid, 8,
+                                     Float8GetDatum(lit.fp64()),
+                                     false, false);
+        if (lit.has_string())
+            return (Expr *)makeConst(
+                TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+                PointerGetDatum(cstring_to_text(lit.string().c_str())),
+                false, false);
+        if (lit.has_date())
+        {
+            /* Substrait: days since 1970-01-01.
+             * PG DateADT: days since 2000-01-01.
+             * POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE = 10957. */
+            int32 pg_date = lit.date() - 10957;
+            return (Expr *)makeConst(DATEOID, -1, InvalidOid, 4,
+                                     Int32GetDatum(pg_date),
+                                     false, true);
+        }
+        if (lit.has_decimal())
+        {
+            const auto &dec = lit.decimal();
+            /* Substrait decimal: value is little-endian 16-byte int,
+             * precision and scale in the type. Convert via string. */
+            const std::string &raw = dec.value();
+            /* Read as little-endian 128-bit signed integer */
+            __int128 val = 0;
+            for (int i = (int)raw.size() - 1; i >= 0; i--)
+                val = (val << 8) | (unsigned char)raw[i];
+
+            bool neg = false;
+            unsigned __int128 uval;
+            if (val < 0)
+            {
+                neg = true;
+                uval = (unsigned __int128)(-(val + 1)) + 1;
+            }
+            else
+                uval = (unsigned __int128)val;
+
+            /* Convert to decimal string */
+            char buf[64];
+            char *p = buf + sizeof(buf) - 1;
+            *p = '\0';
+            int32 scale = dec.scale();
+            int digits = 0;
+            do
+            {
+                if (digits == scale && scale > 0)
+                    *--p = '.';
+                *--p = '0' + (int)(uval % 10);
+                uval /= 10;
+                digits++;
+            } while (uval > 0);
+            /* Pad with leading zeros if needed for scale */
+            while (digits < scale)
+            {
+                *--p = '0';
+                digits++;
+            }
+            if (digits == scale && scale > 0)
+            {
+                *--p = '.';
+                *--p = '0';
+            }
+            if (neg)
+                *--p = '-';
+
+            int32 precision = dec.precision();
+            int32 typmod = ((precision << 16) | scale) + VARHDRSZ;
+
+            Datum numval = DirectFunctionCall3(
+                numeric_in,
+                CStringGetDatum(p),
+                ObjectIdGetDatum(InvalidOid),
+                Int32GetDatum(typmod));
+
+            return (Expr *)makeConst(NUMERICOID, typmod, InvalidOid, -1,
+                                     numval, false, false);
+        }
+
+        if (lit.has_interval_year_to_month())
+        {
+            const auto &iym = lit.interval_year_to_month();
+            Interval *iv = (Interval *)palloc(sizeof(Interval));
+            iv->time = 0;
+            iv->day = 0;
+            iv->month = iym.years() * 12 + iym.months();
+            return (Expr *)makeConst(INTERVALOID, -1, InvalidOid,
+                                     sizeof(Interval),
+                                     PointerGetDatum(iv),
+                                     false, false);
+        }
+        if (lit.has_interval_day_to_second())
+        {
+            const auto &ids = lit.interval_day_to_second();
+            Interval *iv = (Interval *)palloc(sizeof(Interval));
+            iv->time = (int64)ids.seconds() * 1000000;
+            iv->day = ids.days();
+            iv->month = 0;
+            return (Expr *)makeConst(INTERVALOID, -1, InvalidOid,
+                                     sizeof(Interval),
+                                     PointerGetDatum(iv),
+                                     false, false);
+        }
+
+        ereport(ERROR,
+                (errmsg("substrait: unsupported literal type")));
+    }
+
+    /* --- Cast → convert input and apply PG coercion --- */
+    if (expr.has_cast())
+    {
+        const auto &cast = expr.cast();
+        if (!cast.has_input())
+            ereport(ERROR, (errmsg("substrait: cast without input")));
+
+        Expr *input = convert_expression(cast.input(), rtindex, schema,
+                                         func_map, virtuals);
+        Oid src_type = exprType((Node *)input);
+
+        /* Map substrait target type to PG OID. */
+        Oid dst_type = InvalidOid;
+        int32 dst_typmod = -1;
+        if (cast.has_type())
+        {
+            const auto &t = cast.type();
+            if (t.has_bool_())
+                dst_type = BOOLOID;
+            else if (t.has_i16())
+                dst_type = INT2OID;
+            else if (t.has_i32())
+                dst_type = INT4OID;
+            else if (t.has_i64())
+                dst_type = INT8OID;
+            else if (t.has_fp32())
+                dst_type = FLOAT4OID;
+            else if (t.has_fp64())
+                dst_type = FLOAT8OID;
+            else if (t.has_string())
+                dst_type = TEXTOID;
+            else if (t.has_date())
+                dst_type = DATEOID;
+            else if (t.has_decimal())
+            {
+                dst_type = NUMERICOID;
+                int32 precision = t.decimal().precision();
+                int32 scale = t.decimal().scale();
+                dst_typmod = ((precision << 16) | scale) + VARHDRSZ;
+            }
+            else if (t.has_varchar())
+                dst_type = VARCHAROID;
+            else if (t.has_fixed_char())
+                dst_type = BPCHAROID;
+        }
+
+        if (!OidIsValid(dst_type))
+            ereport(ERROR,
+                    (errmsg("substrait: unsupported cast target type")));
+
+        /* No-op if types already match. */
+        if (src_type == dst_type && dst_typmod == -1)
+            return input;
+
+        /* Build a CoerceViaIO or RelabelType depending on cast path. */
+        CoercionPathType pathtype;
+        Oid funcid;
+        pathtype = find_coercion_pathway(dst_type, src_type,
+                                         COERCION_EXPLICIT, &funcid);
+
+        if (pathtype == COERCION_PATH_FUNC && OidIsValid(funcid))
+        {
+            FuncExpr *fe = makeNode(FuncExpr);
+            fe->funcid = funcid;
+            fe->funcresulttype = dst_type;
+            fe->funcretset = false;
+            fe->funcvariadic = false;
+            fe->funcformat = COERCE_EXPLICIT_CAST;
+            fe->funccollid = InvalidOid;
+            fe->inputcollid = InvalidOid;
+            fe->args = list_make1(input);
+            fe->location = -1;
+            Expr *result = (Expr *)fe;
+
+            /* Apply typmod coercion if needed (e.g. NUMERIC(15,2)). */
+            if (dst_typmod != -1)
+            {
+                Oid typmod_func = InvalidOid;
+                /* For numeric, typmod is enforced at storage;
+                 * PG's coercion framework typically handles this. */
+                HeapTuple tp = SearchSysCache2(CASTSOURCETARGET,
+                                               ObjectIdGetDatum(dst_type),
+                                               ObjectIdGetDatum(dst_type));
+                if (HeapTupleIsValid(tp))
+                {
+                    typmod_func = ((Form_pg_cast)GETSTRUCT(tp))->castfunc;
+                    ReleaseSysCache(tp);
+                }
+                (void)typmod_func; /* typmod applied at execution */
+            }
+            return result;
+        }
+        else if (pathtype == COERCION_PATH_RELABELTYPE)
+        {
+            RelabelType *r = makeNode(RelabelType);
+            r->arg = input;
+            r->resulttype = dst_type;
+            r->resulttypmod = dst_typmod;
+            r->resultcollid = InvalidOid;
+            r->relabelformat = COERCE_EXPLICIT_CAST;
+            r->location = -1;
+            return (Expr *)r;
+        }
+        else if (pathtype == COERCION_PATH_COERCEVIAIO)
+        {
+            Oid src_out, dst_in;
+            getTypeOutputInfo(src_type, &src_out, (bool *)NULL);
+            getTypeInputInfo(dst_type, &dst_in, (Oid *)NULL);
+
+            CoerceViaIO *cio = makeNode(CoerceViaIO);
+            cio->arg = input;
+            cio->resulttype = dst_type;
+            cio->resultcollid = InvalidOid;
+            cio->coerceformat = COERCE_EXPLICIT_CAST;
+            cio->location = -1;
+            return (Expr *)cio;
+        }
+
+        ereport(ERROR,
+                (errmsg("substrait: no coercion path from %u to %u",
+                        src_type, dst_type)));
+    }
+
+    /* --- ScalarFunction → OpExpr or BoolExpr --- */
+    if (expr.has_scalar_function())
+    {
+        const auto &sf = expr.scalar_function();
+        auto fit = func_map.find(sf.function_reference());
+        if (fit == func_map.end())
+            ereport(ERROR,
+                    (errmsg("substrait: unknown function anchor %u",
+                            sf.function_reference())));
+
+        const std::string &fname = fit->second;
+
+        /* Boolean connectives */
+        if (fname == "and" || fname == "or")
+        {
+            BoolExprType btype = (fname == "and") ? AND_EXPR : OR_EXPR;
+            List *args = NIL;
+            for (const auto &arg : sf.arguments())
+            {
+                if (!arg.has_value())
+                    ereport(ERROR,
+                            (errmsg("substrait: non-value bool arg")));
+                args = lappend(args,
+                               convert_expression(arg.value(), rtindex,
+                                                  schema, func_map,
+                                                  virtuals));
+            }
+            BoolExpr *be = makeNode(BoolExpr);
+            be->boolop = btype;
+            be->args = args;
+            be->location = -1;
+            return (Expr *)be;
+        }
+
+        if (fname == "not")
+        {
+            if (sf.arguments_size() != 1 || !sf.arguments(0).has_value())
+                ereport(ERROR,
+                        (errmsg("substrait: bad NOT expression")));
+            List *args = list_make1(
+                convert_expression(sf.arguments(0).value(), rtindex,
+                                   schema, func_map, virtuals));
+            BoolExpr *be = makeNode(BoolExpr);
+            be->boolop = NOT_EXPR;
+            be->args = args;
+            be->location = -1;
+            return (Expr *)be;
+        }
+
+        /* is_null / is_not_null */
+        if (fname == "is_null" || fname == "is_not_null")
+        {
+            if (sf.arguments_size() != 1 || !sf.arguments(0).has_value())
+                ereport(ERROR,
+                        (errmsg("substrait: bad null-test expression")));
+            NullTest *nt = makeNode(NullTest);
+            nt->arg = convert_expression(sf.arguments(0).value(), rtindex,
+                                         schema, func_map, virtuals);
+            nt->nulltesttype = (fname == "is_null") ? IS_NULL : IS_NOT_NULL;
+            nt->argisrow = false;
+            nt->location = -1;
+            return (Expr *)nt;
+        }
+
+        /* Operator-based functions (comparison + arithmetic) */
+        auto opit = kOpNameMap.find(fname);
+        if (opit != kOpNameMap.end())
+        {
+            if (sf.arguments_size() != 2)
+                ereport(ERROR,
+                        (errmsg("substrait: operator %s expects 2 args, got %d",
+                                fname.c_str(), sf.arguments_size())));
+
+            Expr *left = convert_expression(sf.arguments(0).value(),
+                                            rtindex, schema, func_map,
+                                            virtuals);
+            Expr *right = convert_expression(sf.arguments(1).value(),
+                                             rtindex, schema, func_map,
+                                             virtuals);
+
+            Oid lefttype = exprType((Node *)left);
+            Oid righttype = exprType((Node *)right);
+
+            List *opname = list_make1(makeString(pstrdup(opit->second)));
+            Oid opoid = LookupOperName(NULL, opname, lefttype, righttype,
+                                       false, -1);
+
+            HeapTuple optup = SearchSysCache1(OPEROID,
+                                              ObjectIdGetDatum(opoid));
+            if (!HeapTupleIsValid(optup))
+                ereport(ERROR,
+                        (errmsg("substrait: operator %s not found",
+                                opit->second)));
+            Form_pg_operator opform = (Form_pg_operator)GETSTRUCT(optup);
+            Oid opfuncid = opform->oprcode;
+            Oid oprestype = opform->oprresult;
+            ReleaseSysCache(optup);
+
+            OpExpr *op = makeNode(OpExpr);
+            op->opno = opoid;
+            op->opfuncid = opfuncid;
+            op->opresulttype = oprestype;
+            op->opretset = false;
+            op->opcollid = InvalidOid;
+            op->inputcollid = InvalidOid;
+            op->args = list_make2(left, right);
+            op->location = -1;
+
+            return (Expr *)op;
+        }
+
+        ereport(ERROR,
+                (errmsg("substrait: unsupported scalar function \"%s\"",
+                        fname.c_str())));
+    }
+
+    ereport(ERROR,
+            (errmsg("substrait: unsupported expression type")));
+    return NULL; /* unreachable */
+}
+
+/* ============================================================
+ * SECTION 6 - Top-level entry point
  * ============================================================ */
 
 extern "C" Query *
@@ -520,6 +953,15 @@ substrait_to_query(const uint8_t *data, size_t len)
 
     const substrait::Rel *cur = &root_rel;
 
+    /* Peel relations outermost-first.
+     * DuckDB plan shapes: [Sort?] > [Project?] > [Aggregate?] > [Project?] > [Filter?] > Read */
+    const substrait::SortRel *sort_rel = nullptr;
+    if (cur->has_sort())
+    {
+        sort_rel = &cur->sort();
+        cur = &sort_rel->input();
+    }
+
     const substrait::ProjectRel *project_rel = nullptr;
     if (cur->has_project())
     {
@@ -534,11 +976,25 @@ substrait_to_query(const uint8_t *data, size_t len)
         cur = &agg_rel->input();
     }
 
+    /* Inner ProjectRel: between Aggregate and Read (e.g., TPC-H Q1). */
+    const substrait::ProjectRel *inner_project_rel = nullptr;
+    if (cur->has_project())
+    {
+        inner_project_rel = &cur->project();
+        cur = &inner_project_rel->input();
+    }
+
+    const substrait::FilterRel *filter_rel = nullptr;
+    if (cur->has_filter())
+    {
+        filter_rel = &cur->filter();
+        cur = &filter_rel->input();
+    }
+
     if (!cur->has_read())
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("substrait: unsupported plan shape - expected "
-                        "[Project?] > [Aggregate?] > Read")));
+                 errmsg("substrait: unsupported plan shape")));
 
     SubstraitSchema schema;
     RangeTblEntry *rte = read_rel_to_rte(cur->read(), schema, query);
@@ -550,14 +1006,197 @@ substrait_to_query(const uint8_t *data, size_t len)
     rtr->rtindex = rtindex;
     query->jointree->fromlist = lappend(query->jointree->fromlist, rtr);
 
+    /* Apply filter: either from standalone FilterRel or ReadRel.filter.
+     * Filter operates on the base schema (before projection). */
+    if (filter_rel != nullptr)
+    {
+        query->jointree->quals = (Node *)convert_expression(
+            filter_rel->condition(), rtindex, schema, func_map);
+    }
+    else if (cur->read().has_filter())
+    {
+        query->jointree->quals = (Node *)convert_expression(
+            cur->read().filter(), rtindex, schema, func_map);
+    }
+
+    /* Apply ReadRel projection: remap schema for upstream operators.
+     * ReadRel.projection narrows/reorders columns; operators above
+     * (aggregate, project) reference the projected field indices. */
+    SubstraitSchema projected_schema = schema;
+    const auto &read = cur->read();
+    if (read.has_projection() &&
+        read.projection().has_select())
+    {
+        const auto &sel = read.projection().select();
+        projected_schema.clear();
+        for (int i = 0; i < sel.struct_items_size(); i++)
+        {
+            int base_idx = sel.struct_items(i).field();
+            if (base_idx >= 0 && base_idx < (int)schema.size())
+                projected_schema.push_back(schema[base_idx]);
+        }
+    }
+
+    /* Inner ProjectRel: precompute expressions that the aggregate
+     * references. The ProjectRel output is (input cols + expression cols),
+     * then optionally reordered by emit.outputMapping.
+     *
+     * We build a combined column map indexed by the output position.
+     * Real columns use the projected_schema; virtual columns are stored
+     * in a position-indexed map so convert_expression can return them. */
+    VirtualMap virtual_map;
+    if (inner_project_rel != nullptr)
+    {
+        /* Build virtual expressions from the projected_schema context. */
+        std::vector<Expr *> raw_virtuals;
+        for (int i = 0; i < inner_project_rel->expressions_size(); i++)
+        {
+            raw_virtuals.push_back(convert_expression(
+                inner_project_rel->expressions(i), rtindex,
+                projected_schema, func_map));
+        }
+
+        int n_input = (int)projected_schema.size();
+
+        if (inner_project_rel->has_common() &&
+            inner_project_rel->common().has_emit())
+        {
+            /* Emit.outputMapping reorders (input cols + expr cols). */
+            const auto &mapping =
+                inner_project_rel->common().emit().output_mapping();
+
+            SubstraitSchema new_schema;
+            for (int i = 0; i < mapping.size(); i++)
+            {
+                int src = mapping.Get(i);
+                if (src < n_input)
+                {
+                    new_schema.push_back(projected_schema[src]);
+                }
+                else
+                {
+                    Expr *ve = raw_virtuals[src - n_input];
+                    new_schema.push_back({0, exprType((Node *)ve)});
+                    virtual_map[i] = ve;
+                }
+            }
+            projected_schema = new_schema;
+        }
+        else
+        {
+            /* No emit — virtuals are appended after input columns. */
+            for (size_t i = 0; i < raw_virtuals.size(); i++)
+            {
+                Expr *ve = raw_virtuals[i];
+                projected_schema.push_back({0, exprType((Node *)ve)});
+                virtual_map[n_input + (int)i] = ve;
+            }
+        }
+    }
+
     if (agg_rel != nullptr)
     {
         query->targetList = aggregate_rel_to_targetlist(
-            *agg_rel, query, rtindex, schema, func_map);
+            *agg_rel, query, rtindex, projected_schema, func_map, virtual_map);
     }
     else
     {
         query->targetList = build_star_tlist(rte, rtindex);
+    }
+
+    /* ProjectRel: append computed expressions to target list.
+     * Substrait ProjectRel output = input columns + expression columns.
+     * The root RelRoot.names gives the final column names. */
+    if (project_rel != nullptr && project_rel->expressions_size() > 0)
+    {
+        const substrait::PlanRel &pr = plan.relations(0);
+        int name_idx = list_length(query->targetList);
+
+        for (int i = 0; i < project_rel->expressions_size(); i++)
+        {
+            Expr *expr = convert_expression(
+                project_rel->expressions(i), rtindex, projected_schema,
+                func_map);
+
+            const char *colname = "expr";
+            if (pr.has_root() && name_idx < pr.root().names_size())
+                colname = pr.root().names(name_idx).c_str();
+
+            TargetEntry *tle = makeTargetEntry(
+                expr,
+                (AttrNumber)(name_idx + 1),
+                pstrdup(colname),
+                false);
+            query->targetList = lappend(query->targetList, tle);
+            name_idx++;
+        }
+    }
+
+    /* SortRel → query->sortClause.
+     * Sort field references index into the final target list. */
+    if (sort_rel != nullptr)
+    {
+        Index next_sgref = 0;
+        /* Find max existing ressortgroupref (set by GROUP BY). */
+        ListCell *lc;
+        foreach (lc, query->targetList)
+        {
+            TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            if (tle->ressortgroupref > next_sgref)
+                next_sgref = tle->ressortgroupref;
+        }
+        next_sgref++;
+
+        for (int i = 0; i < sort_rel->sorts_size(); i++)
+        {
+            const auto &sf = sort_rel->sorts(i);
+
+            /* Resolve the sort expression to a target list entry. */
+            if (!sf.has_expr() || !sf.expr().has_selection())
+                ereport(ERROR,
+                        (errmsg("substrait: non-field sort expression")));
+            int field_idx = sf.expr().selection()
+                                .direct_reference().struct_field().field();
+
+            /* Target list is 1-indexed; field_idx is 0-indexed. */
+            if (field_idx < 0 || field_idx >= list_length(query->targetList))
+                ereport(ERROR,
+                        (errmsg("substrait: sort field %d out of range",
+                                field_idx)));
+            TargetEntry *tle =
+                (TargetEntry *)list_nth(query->targetList, field_idx);
+
+            /* Assign ressortgroupref if not already set (by GROUP BY). */
+            if (tle->ressortgroupref == 0)
+                tle->ressortgroupref = next_sgref++;
+
+            /* Determine sort direction. */
+            bool is_desc = false;
+            bool nulls_first = false;
+            if (sf.has_direction())
+            {
+                auto dir = sf.direction();
+                is_desc = (dir == substrait::SortField::SORT_DIRECTION_DESC_NULLS_FIRST ||
+                           dir == substrait::SortField::SORT_DIRECTION_DESC_NULLS_LAST);
+                nulls_first = (dir == substrait::SortField::SORT_DIRECTION_ASC_NULLS_FIRST ||
+                               dir == substrait::SortField::SORT_DIRECTION_DESC_NULLS_FIRST);
+            }
+
+            Oid typeoid = exprType((Node *)tle->expr);
+            Oid ltop, eqop, gtop;
+            bool hashable;
+            get_sort_group_operators(typeoid, !is_desc, true, is_desc,
+                                     &ltop, &eqop, &gtop, &hashable);
+
+            SortGroupClause *sgc = makeNode(SortGroupClause);
+            sgc->tleSortGroupRef = tle->ressortgroupref;
+            sgc->eqop = eqop;
+            sgc->sortop = is_desc ? gtop : ltop;
+            sgc->reverse_sort = is_desc;
+            sgc->nulls_first = nulls_first;
+            sgc->hashable = hashable;
+            query->sortClause = lappend(query->sortClause, sgc);
+        }
     }
 
     return query;
