@@ -39,44 +39,48 @@ TPCH_DIR = os.path.join(SCRIPT_DIR, "tpch")
 
 # Features the converter currently handles.
 IMPLEMENTED = {"read", "aggregate", "project", "filter", "sort",
-               "cast", "interval_day", "interval_year"}
+               "cast", "interval_day", "interval_year", "cross",
+               "like", "extract"}
 
 # TPC-H: features each query requires (from Isthmus plan analysis).
 TPCH_REQUIRES = {
     1:  {"aggregate", "filter", "project", "read", "sort", "cast",
          "interval_day"},
     2:  {"aggregate", "filter", "project", "read", "sort", "fetch",
-         "cross", "cast", "subquery"},
+         "cross", "cast", "subquery", "like"},
     3:  {"aggregate", "filter", "project", "read", "sort", "fetch",
          "cross", "cast"},
     4:  {"aggregate", "filter", "project", "read", "sort", "subquery",
          "interval_year"},
     5:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast"},
     6:  {"aggregate", "filter", "project", "read", "interval_year"},
-    7:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast"},
+    7:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast",
+         "extract"},
     8:  {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "if_then"},
-    9:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast"},
+         "cast", "if_then", "extract"},
+    9:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast",
+         "like", "extract"},
     10: {"aggregate", "filter", "project", "read", "sort", "fetch",
          "cross", "cast"},
     11: {"aggregate", "filter", "project", "read", "sort", "cross",
          "cast", "subquery"},
     12: {"aggregate", "filter", "project", "read", "sort", "cross",
          "cast", "if_then"},
-    13: {"aggregate", "filter", "project", "read", "sort", "join", "cast"},
+    13: {"aggregate", "filter", "project", "read", "sort", "join", "cast",
+         "like"},
     14: {"aggregate", "filter", "project", "read", "cross", "cast",
-         "if_then"},
+         "if_then", "like"},
     15: {"aggregate", "filter", "project", "read", "sort", "cross",
          "cast", "subquery"},
     16: {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "subquery"},
+         "cast", "subquery", "like"},
     17: {"aggregate", "filter", "project", "read", "cross", "cast",
          "subquery"},
     18: {"aggregate", "filter", "project", "read", "sort", "fetch",
          "cross", "subquery"},
     19: {"aggregate", "filter", "project", "read", "cross", "cast"},
     20: {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "subquery"},
+         "cast", "subquery", "like"},
     21: {"aggregate", "filter", "project", "read", "sort", "fetch",
          "cross", "subquery"},
     22: {"aggregate", "filter", "project", "read", "sort", "subquery"},
@@ -346,28 +350,6 @@ def setup(*names):
         for n in names)
     isthmus_creates = [TABLES[n][0] for n in names]
     return pg_setup, isthmus_creates
-
-
-def quote_upper(sql):
-    """Convert lowercase-identifier SQL to PG double-quoted UPPERCASE SQL.
-
-    Simple heuristic: quote words that look like identifiers (after FROM,
-    table.col patterns). Good enough for our simple unit test queries.
-    """
-    import re
-    # Quote table names after FROM/JOIN/INTO
-    sql = re.sub(r'\b(FROM|JOIN|INTO)\s+(\w+)', lambda m: f'{m.group(1)} "{m.group(2).upper()}"', sql, flags=re.IGNORECASE)
-    # Quote column references (standalone words that aren't SQL keywords)
-    keywords = {'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'AS',
-                'AND', 'OR', 'NOT', 'IN', 'ON', 'JOIN', 'INNER', 'LEFT',
-                'RIGHT', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ASC', 'DESC',
-                'LIMIT', 'OFFSET', 'HAVING', 'DISTINCT', 'INTO', 'INSERT',
-                'VALUES', 'NULL', 'TRUE', 'FALSE', 'CASE', 'WHEN', 'THEN',
-                'ELSE', 'END', 'BETWEEN', 'LIKE', 'IS', 'EXISTS', 'ALL',
-                'ANY', 'SOME', 'UNION', 'INTERSECT', 'EXCEPT', 'WITH',
-                'CAST', 'INTERVAL', 'DATE', 'TIMESTAMP', 'INTEGER', 'VARCHAR',
-                'DECIMAL', 'BIGINT', 'CHAR', 'BOOLEAN', 'FLOAT', 'DOUBLE'}
-    return sql
 
 
 def pg_query_for(query):

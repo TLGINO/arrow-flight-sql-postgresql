@@ -2,7 +2,8 @@
  * substrait_to_query.cpp
  *
  * Converts a serialized Substrait Plan into a PostgreSQL Query* tree.
- * Supported: [SortRel?] > [ProjectRel?] > [AggregateRel?] > [ProjectRel?] > [FilterRel?] > ReadRel
+ * Supported: [SortRel?] > [ProjectRel?] > [AggregateRel?] > [ProjectRel?] > [FilterRel?] > ReadRel|CrossRel
+ * CrossRel trees (nested cross products) produce multi-table FROM clauses.
  * ReadRel.filter and ReadRel.projection are also handled.
  *
  * Tested against PostgreSQL 18 + protobuf 3.x.
@@ -13,9 +14,9 @@
 
 /* --- Step 1: C++ standard library (no conflicts) --- */
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
-#include <utility>
 
 /* --- Step 2: Protobuf / Substrait headers (must be before postgres.h) --- */
 #include "substrait/plan.pb.h"
@@ -85,7 +86,32 @@ extern "C"
  * SECTION 1 - Schema helpers
  * ============================================================ */
 
-typedef std::vector<std::pair<AttrNumber, Oid>> SubstraitSchema;
+/* (rtindex, attnum, typeoid) per field.
+ * rtindex is 0 as placeholder in read_rel_to_rte; caller fixes up. */
+typedef std::vector<std::tuple<int, AttrNumber, Oid>> SubstraitSchema;
+
+/* String type helpers — shared by aggregate, like, and operator coercion. */
+static bool
+is_string_type(Oid t)
+{
+    return t == TEXTOID || t == VARCHAROID || t == BPCHAROID;
+}
+
+static Expr *
+coerce_to_text(Expr *e)
+{
+    Oid t = exprType((Node *)e);
+    if (t == TEXTOID)
+        return e;
+    RelabelType *r = makeNode(RelabelType);
+    r->arg = e;
+    r->resulttype = TEXTOID;
+    r->resulttypmod = -1;
+    r->resultcollid = DEFAULT_COLLATION_OID;
+    r->relabelformat = COERCE_IMPLICIT_CAST;
+    r->location = -1;
+    return (Expr *)r;
+}
 
 static List *
 build_star_tlist(RangeTblEntry *rte, int rtindex)
@@ -186,7 +212,7 @@ read_rel_to_rte(const substrait::ReadRel &read,
                     continue;
                 if (NameStr(attr->attname) == col)
                 {
-                    schema_out.push_back({attr->attnum, attr->atttypid});
+                    schema_out.push_back({0, attr->attnum, attr->atttypid});
                     colnames = lappend(colnames,
                                        makeString(pstrdup(col.c_str())));
                     found = true;
@@ -206,7 +232,7 @@ read_rel_to_rte(const substrait::ReadRel &read,
             Form_pg_attribute attr = TupleDescAttr(tupdesc, j);
             if (attr->attisdropped)
                 continue;
-            schema_out.push_back({attr->attnum, attr->atttypid});
+            schema_out.push_back({0, attr->attnum, attr->atttypid});
             colnames = lappend(colnames,
                                makeString(pstrdup(NameStr(attr->attname))));
         }
@@ -232,6 +258,40 @@ read_rel_to_rte(const substrait::ReadRel &read,
     return rte;
 }
 
+/* Recursively process a base relation tree (Read or nested Cross).
+ * Each ReadRel becomes an RTE; CrossRel concatenates left+right schemas. */
+static void
+process_base_rel(const substrait::Rel &rel, Query *query,
+                 SubstraitSchema &schema_out)
+{
+    if (rel.has_read())
+    {
+        SubstraitSchema local;
+        RangeTblEntry *rte = read_rel_to_rte(rel.read(), local, query);
+        query->rtable = lappend(query->rtable, rte);
+        int rtindex = list_length(query->rtable);
+
+        RangeTblRef *rtr = makeNode(RangeTblRef);
+        rtr->rtindex = rtindex;
+        query->jointree->fromlist = lappend(query->jointree->fromlist, rtr);
+
+        for (auto &[rt, attnum, typeoid] : local)
+            rt = rtindex;
+        schema_out.insert(schema_out.end(), local.begin(), local.end());
+    }
+    else if (rel.has_cross())
+    {
+        const auto &cross = rel.cross();
+        process_base_rel(cross.left(), query, schema_out);
+        process_base_rel(cross.right(), query, schema_out);
+    }
+    else
+    {
+        ereport(ERROR,
+                (errmsg("substrait: unsupported base relation type")));
+    }
+}
+
 /* Virtual expression map: field_index → precomputed PG Expr.
  * Used for inner ProjectRel computed columns. */
 typedef std::unordered_map<int, Expr *> VirtualMap;
@@ -239,7 +299,6 @@ typedef std::unordered_map<int, Expr *> VirtualMap;
 /* Forward declaration — defined in Section 5. */
 static Expr *
 convert_expression(const substrait::Expression &expr,
-                   int rtindex,
                    const SubstraitSchema &schema,
                    const FuncMap &func_map,
                    const VirtualMap &virtuals = {});
@@ -309,7 +368,6 @@ lookup_count_star(void)
 static List *
 aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
                             Query *query,
-                            int rtindex,
                             const SubstraitSchema &schema,
                             const FuncMap &func_map,
                             const VirtualMap &virtuals = {})
@@ -318,9 +376,6 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
 
     List *tlist = NIL;
     AttrNumber resno = 1;
-
-    RangeTblEntry *scan_rte =
-        (RangeTblEntry *)list_nth(query->rtable, rtindex - 1);
 
     /* --- Grouping keys --- */
     for (const auto &grouping : agg.groupings())
@@ -345,7 +400,7 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
                         (errmsg("substrait: grouping field index %d out of range",
                                 field_idx)));
 
-            auto [attnum, typeoid] = schema[field_idx];
+            auto [rt, attnum, typeoid] = schema[field_idx];
 
             Expr *group_expr;
             char *attname;
@@ -357,13 +412,13 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
             }
             else
             {
-                Oid collation = InvalidOid;
-                if (typeoid == TEXTOID || typeoid == VARCHAROID ||
-                    typeoid == BPCHAROID)
-                    collation = DEFAULT_COLLATION_OID;
-                group_expr = (Expr *)makeVar(rtindex, attnum, typeoid,
+                Oid collation = is_string_type(typeoid)
+                    ? DEFAULT_COLLATION_OID : InvalidOid;
+                group_expr = (Expr *)makeVar(rt, attnum, typeoid,
                                              -1, collation, 0);
-                attname = get_attname(scan_rte->relid, attnum, false);
+                RangeTblEntry *field_rte =
+                    (RangeTblEntry *)list_nth(query->rtable, rt - 1);
+                attname = get_attname(field_rte->relid, attnum, false);
             }
 
             Index sortgroupref = (Index)resno;
@@ -423,7 +478,7 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
                     ereport(ERROR,
                             (errmsg("substrait: enum/type agg args unsupported")));
                 Expr *e = convert_expression(
-                    arg.value(), rtindex, schema, func_map, virtuals);
+                    arg.value(), schema, func_map, virtuals);
                 converted_args.push_back(e);
                 argtypes.push_back(exprType((Node *)e));
             }
@@ -503,7 +558,6 @@ static const std::unordered_map<std::string, const char *> kOpNameMap = {
 
 static Expr *
 convert_expression(const substrait::Expression &expr,
-                   int rtindex,
                    const SubstraitSchema &schema,
                    const FuncMap &func_map,
                    const VirtualMap &virtuals)
@@ -527,13 +581,11 @@ convert_expression(const substrait::Expression &expr,
         if (vit != virtuals.end())
             return (Expr *)copyObjectImpl(vit->second);
 
-        auto [attnum, typeoid] = schema[idx];
-        Oid collation = InvalidOid;
-        if (typeoid == TEXTOID || typeoid == VARCHAROID ||
-            typeoid == BPCHAROID)
-            collation = DEFAULT_COLLATION_OID;
+        auto [rt, attnum, typeoid] = schema[idx];
+        Oid collation = is_string_type(typeoid)
+            ? DEFAULT_COLLATION_OID : InvalidOid;
 
-        return (Expr *)makeVar(rtindex, attnum, typeoid, -1, collation, 0);
+        return (Expr *)makeVar(rt, attnum, typeoid, -1, collation, 0);
     }
 
     /* --- Literal → Const --- */
@@ -573,6 +625,18 @@ convert_expression(const substrait::Expression &expr,
             return (Expr *)makeConst(
                 TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
                 PointerGetDatum(cstring_to_text(lit.string().c_str())),
+                false, false);
+        if (lit.has_var_char())
+            return (Expr *)makeConst(
+                TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+                PointerGetDatum(cstring_to_text(
+                    lit.var_char().value().c_str())),
+                false, false);
+        if (lit.has_fixed_char())
+            return (Expr *)makeConst(
+                TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+                PointerGetDatum(cstring_to_text(
+                    lit.fixed_char().c_str())),
                 false, false);
         if (lit.has_date())
         {
@@ -682,7 +746,7 @@ convert_expression(const substrait::Expression &expr,
         if (!cast.has_input())
             ereport(ERROR, (errmsg("substrait: cast without input")));
 
-        Expr *input = convert_expression(cast.input(), rtindex, schema,
+        Expr *input = convert_expression(cast.input(), schema,
                                          func_map, virtuals);
         Oid src_type = exprType((Node *)input);
 
@@ -821,7 +885,7 @@ convert_expression(const substrait::Expression &expr,
                     ereport(ERROR,
                             (errmsg("substrait: non-value bool arg")));
                 args = lappend(args,
-                               convert_expression(arg.value(), rtindex,
+                               convert_expression(arg.value(),
                                                   schema, func_map,
                                                   virtuals));
             }
@@ -838,7 +902,7 @@ convert_expression(const substrait::Expression &expr,
                 ereport(ERROR,
                         (errmsg("substrait: bad NOT expression")));
             List *args = list_make1(
-                convert_expression(sf.arguments(0).value(), rtindex,
+                convert_expression(sf.arguments(0).value(),
                                    schema, func_map, virtuals));
             BoolExpr *be = makeNode(BoolExpr);
             be->boolop = NOT_EXPR;
@@ -854,12 +918,85 @@ convert_expression(const substrait::Expression &expr,
                 ereport(ERROR,
                         (errmsg("substrait: bad null-test expression")));
             NullTest *nt = makeNode(NullTest);
-            nt->arg = convert_expression(sf.arguments(0).value(), rtindex,
+            nt->arg = convert_expression(sf.arguments(0).value(),
                                          schema, func_map, virtuals);
             nt->nulltesttype = (fname == "is_null") ? IS_NULL : IS_NOT_NULL;
             nt->argisrow = false;
             nt->location = -1;
             return (Expr *)nt;
+        }
+
+        /* like → PG ~~ operator (text ~~ text) */
+        if (fname == "like")
+        {
+            if (sf.arguments_size() != 2)
+                ereport(ERROR,
+                        (errmsg("substrait: like expects 2 args")));
+            Expr *left = coerce_to_text(convert_expression(
+                sf.arguments(0).value(), schema, func_map, virtuals));
+            Expr *right = coerce_to_text(convert_expression(
+                sf.arguments(1).value(), schema, func_map, virtuals));
+
+            List *opname = list_make1(makeString(pstrdup("~~")));
+            Oid opoid = LookupOperName(NULL, opname, TEXTOID, TEXTOID,
+                                       false, -1);
+            HeapTuple optup = SearchSysCache1(OPEROID,
+                                              ObjectIdGetDatum(opoid));
+            Form_pg_operator opform = (Form_pg_operator)GETSTRUCT(optup);
+            OpExpr *op = makeNode(OpExpr);
+            op->opno = opoid;
+            op->opfuncid = opform->oprcode;
+            op->opresulttype = opform->oprresult;
+            op->opretset = false;
+            op->opcollid = InvalidOid;
+            op->inputcollid = DEFAULT_COLLATION_OID;
+            op->args = list_make2(left, right);
+            op->location = -1;
+            ReleaseSysCache(optup);
+            return (Expr *)op;
+        }
+
+        /* extract → date_part(text, date/timestamp) */
+        if (fname == "extract")
+        {
+            if (sf.arguments_size() != 2)
+                ereport(ERROR,
+                        (errmsg("substrait: extract expects 2 args")));
+
+            /* arg0 = field (enum string like "YEAR"), arg1 = date value */
+            const char *field_name = "year";
+            const auto &arg0 = sf.arguments(0);
+            if (arg0.has_enum_())
+            {
+                std::string e = arg0.enum_();
+                /* Lowercase for PG date_part */
+                for (auto &ch : e) ch = tolower(ch);
+                field_name = pstrdup(e.c_str());
+            }
+
+            Expr *date_arg = convert_expression(sf.arguments(1).value(),
+                                                schema, func_map, virtuals);
+            Expr *field_text = (Expr *)makeConst(
+                TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+                PointerGetDatum(cstring_to_text(field_name)),
+                false, false);
+
+            Oid date_type = exprType((Node *)date_arg);
+            Oid argtypes[2] = {TEXTOID, date_type};
+            List *funcname = list_make1(makeString(pstrdup("date_part")));
+            Oid funcoid = LookupFuncName(funcname, 2, argtypes, false);
+
+            FuncExpr *fe = makeNode(FuncExpr);
+            fe->funcid = funcoid;
+            fe->funcresulttype = FLOAT8OID;
+            fe->funcretset = false;
+            fe->funcvariadic = false;
+            fe->funcformat = COERCE_EXPLICIT_CALL;
+            fe->funccollid = InvalidOid;
+            fe->inputcollid = InvalidOid;
+            fe->args = list_make2(field_text, date_arg);
+            fe->location = -1;
+            return (Expr *)fe;
         }
 
         /* Operator-based functions (comparison + arithmetic) */
@@ -872,14 +1009,24 @@ convert_expression(const substrait::Expression &expr,
                                 fname.c_str(), sf.arguments_size())));
 
             Expr *left = convert_expression(sf.arguments(0).value(),
-                                            rtindex, schema, func_map,
+                                            schema, func_map,
                                             virtuals);
             Expr *right = convert_expression(sf.arguments(1).value(),
-                                             rtindex, schema, func_map,
+                                             schema, func_map,
                                              virtuals);
 
             Oid lefttype = exprType((Node *)left);
             Oid righttype = exprType((Node *)right);
+
+            /* Coerce text/varchar/bpchar to a common type for operator lookup. */
+            if (is_string_type(lefttype) && is_string_type(righttype) &&
+                lefttype != righttype)
+            {
+                left = coerce_to_text(left);
+                right = coerce_to_text(right);
+                lefttype = TEXTOID;
+                righttype = TEXTOID;
+            }
 
             List *opname = list_make1(makeString(pstrdup(opit->second)));
             Oid opoid = LookupOperName(NULL, opname, lefttype, righttype,
@@ -896,13 +1043,17 @@ convert_expression(const substrait::Expression &expr,
             Oid oprestype = opform->oprresult;
             ReleaseSysCache(optup);
 
+            Oid inputcollid = InvalidOid;
+            if (is_string_type(lefttype) || is_string_type(righttype))
+                inputcollid = DEFAULT_COLLATION_OID;
+
             OpExpr *op = makeNode(OpExpr);
             op->opno = opoid;
             op->opfuncid = opfuncid;
             op->opresulttype = oprestype;
             op->opretset = false;
             op->opcollid = InvalidOid;
-            op->inputcollid = InvalidOid;
+            op->inputcollid = inputcollid;
             op->args = list_make2(left, right);
             op->location = -1;
 
@@ -991,49 +1142,45 @@ substrait_to_query(const uint8_t *data, size_t len)
         cur = &filter_rel->input();
     }
 
-    if (!cur->has_read())
+    if (!cur->has_read() && !cur->has_cross())
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("substrait: unsupported plan shape")));
 
     SubstraitSchema schema;
-    RangeTblEntry *rte = read_rel_to_rte(cur->read(), schema, query);
-
-    query->rtable = lappend(query->rtable, rte);
-    int rtindex = list_length(query->rtable);
-
-    RangeTblRef *rtr = makeNode(RangeTblRef);
-    rtr->rtindex = rtindex;
-    query->jointree->fromlist = lappend(query->jointree->fromlist, rtr);
+    process_base_rel(*cur, query, schema);
 
     /* Apply filter: either from standalone FilterRel or ReadRel.filter.
      * Filter operates on the base schema (before projection). */
     if (filter_rel != nullptr)
     {
         query->jointree->quals = (Node *)convert_expression(
-            filter_rel->condition(), rtindex, schema, func_map);
+            filter_rel->condition(), schema, func_map);
     }
-    else if (cur->read().has_filter())
+    else if (cur->has_read() && cur->read().has_filter())
     {
         query->jointree->quals = (Node *)convert_expression(
-            cur->read().filter(), rtindex, schema, func_map);
+            cur->read().filter(), schema, func_map);
     }
 
     /* Apply ReadRel projection: remap schema for upstream operators.
      * ReadRel.projection narrows/reorders columns; operators above
      * (aggregate, project) reference the projected field indices. */
     SubstraitSchema projected_schema = schema;
-    const auto &read = cur->read();
-    if (read.has_projection() &&
-        read.projection().has_select())
+    if (cur->has_read())
     {
-        const auto &sel = read.projection().select();
-        projected_schema.clear();
-        for (int i = 0; i < sel.struct_items_size(); i++)
+        const auto &read = cur->read();
+        if (read.has_projection() &&
+            read.projection().has_select())
         {
-            int base_idx = sel.struct_items(i).field();
-            if (base_idx >= 0 && base_idx < (int)schema.size())
-                projected_schema.push_back(schema[base_idx]);
+            const auto &sel = read.projection().select();
+            projected_schema.clear();
+            for (int i = 0; i < sel.struct_items_size(); i++)
+            {
+                int base_idx = sel.struct_items(i).field();
+                if (base_idx >= 0 && base_idx < (int)schema.size())
+                    projected_schema.push_back(schema[base_idx]);
+            }
         }
     }
 
@@ -1052,7 +1199,7 @@ substrait_to_query(const uint8_t *data, size_t len)
         for (int i = 0; i < inner_project_rel->expressions_size(); i++)
         {
             raw_virtuals.push_back(convert_expression(
-                inner_project_rel->expressions(i), rtindex,
+                inner_project_rel->expressions(i),
                 projected_schema, func_map));
         }
 
@@ -1076,7 +1223,7 @@ substrait_to_query(const uint8_t *data, size_t len)
                 else
                 {
                     Expr *ve = raw_virtuals[src - n_input];
-                    new_schema.push_back({0, exprType((Node *)ve)});
+                    new_schema.push_back({0, 0, exprType((Node *)ve)});
                     virtual_map[i] = ve;
                 }
             }
@@ -1088,7 +1235,7 @@ substrait_to_query(const uint8_t *data, size_t len)
             for (size_t i = 0; i < raw_virtuals.size(); i++)
             {
                 Expr *ve = raw_virtuals[i];
-                projected_schema.push_back({0, exprType((Node *)ve)});
+                projected_schema.push_back({0, 0, exprType((Node *)ve)});
                 virtual_map[n_input + (int)i] = ve;
             }
         }
@@ -1097,11 +1244,15 @@ substrait_to_query(const uint8_t *data, size_t len)
     if (agg_rel != nullptr)
     {
         query->targetList = aggregate_rel_to_targetlist(
-            *agg_rel, query, rtindex, projected_schema, func_map, virtual_map);
+            *agg_rel, query, projected_schema, func_map, virtual_map);
     }
     else
     {
-        query->targetList = build_star_tlist(rte, rtindex);
+        /* Single-table star select — get rtindex from first schema entry. */
+        auto [rt0, att0, typ0] = schema[0];
+        RangeTblEntry *rte =
+            (RangeTblEntry *)list_nth(query->rtable, rt0 - 1);
+        query->targetList = build_star_tlist(rte, rt0);
     }
 
     /* ProjectRel: append computed expressions to target list.
@@ -1115,7 +1266,7 @@ substrait_to_query(const uint8_t *data, size_t len)
         for (int i = 0; i < project_rel->expressions_size(); i++)
         {
             Expr *expr = convert_expression(
-                project_rel->expressions(i), rtindex, projected_schema,
+                project_rel->expressions(i), projected_schema,
                 func_map);
 
             const char *colname = "expr";
