@@ -47,6 +47,18 @@ arrow_flight_sql = dependency(
   method: 'cmake',
   modules: ['ArrowFlightSql::arrow_flight_sql_shared']
 )
+protobuf = dependency('protobuf')
+
+# Substrait support
+substrait_inc_args = ['-isystem', meson.project_source_root() / 'src']
+substrait_sources = files(
+  'src/substrait_to_query.cpp',
+  'src/substrait/plan.pb.cc',
+  'src/substrait/algebra.pb.cc',
+  'src/substrait/type.pb.cc',
+  'src/substrait/extended_expression.pb.cc',
+  'src/substrait/extensions/extensions.pb.cc',
+)
 if arrow_flight_sql.version().version_compare('<14.0.0')
   # Workaround for a bug that ArrowFlightSQL::arrow_flight_sql_shared
   # doesn't depend on ArrowFlight::arrow_flight_shared.
@@ -80,9 +92,9 @@ if host_machine.system() == 'darwin' and \
 endif
 afs = shared_module(
   'arrow_flight_sql',
-  'src/afs.cc',
-  cpp_args: cpp_args,
-  dependencies: [arrow_flight_sql, postgresql],
+  ['src/afs.cc'] + substrait_sources,
+  cpp_args: cpp_args + substrait_inc_args,
+  dependencies: [arrow_flight_sql, postgresql, protobuf],
   name_prefix: '',
   name_suffix: name_suffix,
   install: true,

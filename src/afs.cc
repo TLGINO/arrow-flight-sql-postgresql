@@ -20,6 +20,7 @@ extern "C"
 #include <postgres.h>
 
 #include <access/xact.h>
+#include <executor/executor.h>
 #include <executor/spi.h>
 #include <fmgr.h>
 #include <lib/dshash.h>
@@ -27,6 +28,8 @@ extern "C"
 #include <libpq/libpq-be.h>
 #include <libpq/libpq.h>
 #include <miscadmin.h>
+#include <nodes/plannodes.h>
+#include <optimizer/planner.h>
 #include <postmaster/bgworker.h>
 #include <postmaster/postmaster.h>
 #include <storage/ipc.h>
@@ -39,12 +42,20 @@ extern "C"
 #include <utils/dsa.h>
 #include <utils/guc.h>
 #include <utils/memutils.h>
+#include <utils/numeric.h>
 #include <utils/snapmgr.h>
 #include <utils/timestamp.h>
 #include <utils/wait_event.h>
 }
 
 #undef Abs
+
+// PG 18 renamed pg_attribute_noreturn() to pg_noreturn
+#if PG_VERSION_NUM >= 180000
+#	ifndef pg_attribute_noreturn
+#		define pg_attribute_noreturn() pg_noreturn
+#	endif
+#endif
 
 #if PG_VERSION_NUM >= 150000
 #	define AFS_HAVE_SHMEM_REQUEST_HOOK
@@ -99,6 +110,8 @@ extern "C"
 	extern PGDLLEXPORT void afs_executor(Datum datum) pg_attribute_noreturn();
 	extern PGDLLEXPORT void afs_server(Datum datum) pg_attribute_noreturn();
 	extern PGDLLEXPORT void afs_main(Datum datum) pg_attribute_noreturn();
+
+	extern Query *substrait_to_query(const uint8_t *data, size_t len);
 }
 
 namespace {
@@ -418,6 +431,7 @@ enum class Action
 	SetParameters,
 	SelectPreparedStatement,
 	UpdatePreparedStatement,
+	SubstraitSelect,
 };
 
 const char*
@@ -441,6 +455,8 @@ action_name(Action action)
 			return "Action::SelectPreparedStatement";
 		case Action::UpdatePreparedStatement:
 			return "Action::UpdatePreparedStatement";
+		case Action::SubstraitSelect:
+			return "Action::SubstraitSelect";
 		default:
 			return "Action::Unknown";
 	}
@@ -460,6 +476,23 @@ dsa_pointer_set_string(dsa_pointer& pointer, dsa_area* area, const std::string& 
 	}
 	pointer = dsa_allocate(area, input.size() + 1);
 	memcpy(dsa_get_address(area, pointer), input.c_str(), input.size() + 1);
+}
+
+void
+dsa_pointer_set_bytes(dsa_pointer& pointer, dsa_area* area,
+                      const void* data, size_t size)
+{
+	if (DsaPointerIsValid(pointer))
+	{
+		dsa_free(area, pointer);
+		pointer = InvalidDsaPointer;
+	}
+	if (size == 0)
+	{
+		return;
+	}
+	pointer = dsa_allocate(area, size);
+	memcpy(dsa_get_address(area, pointer), data, size);
 }
 
 // Session data used in only one process.
@@ -507,6 +540,8 @@ struct SharedSessionData {
 	dsa_pointer prepareQuery;
 	dsa_pointer preparedStatementHandle;
 	bool setParametersFinished;
+	dsa_pointer substraitPlan;
+	size_t substraitPlanSize;
 	SharedRingBufferData bufferData;
 };
 
@@ -523,6 +558,12 @@ shared_session_data_initialize(SharedSessionData* session,
 	session->started = false;
 	session->initialized = false;
 	session->finished = false;
+	/* dshash_find_or_insert does not zero new entries; reset pointers
+	 * so dsa_pointer_set_string won't double-free stale values. */
+	session->databaseName = InvalidDsaPointer;
+	session->userName = InvalidDsaPointer;
+	session->password = InvalidDsaPointer;
+	session->clientAddress = InvalidDsaPointer;
 	dsa_pointer_set_string(session->databaseName, area, databaseName);
 	dsa_pointer_set_string(session->userName, area, userName);
 	dsa_pointer_set_string(session->password, area, password);
@@ -534,6 +575,8 @@ shared_session_data_initialize(SharedSessionData* session,
 	session->prepareQuery = InvalidDsaPointer;
 	session->preparedStatementHandle = InvalidDsaPointer;
 	session->setParametersFinished = false;
+	session->substraitPlan = InvalidDsaPointer;
+	session->substraitPlanSize = 0;
 	SharedRingBuffer::initialize_data(&(session->bufferData));
 }
 
@@ -658,6 +701,11 @@ class Processor {
 	void set_shared_string(dsa_pointer& pointer, const std::string& input)
 	{
 		dsa_pointer_set_string(pointer, area_, input);
+	}
+
+	void set_shared_bytes(dsa_pointer& pointer, const void* data, size_t size)
+	{
+		dsa_pointer_set_bytes(pointer, area_, data, size);
 	}
 
 	virtual pid_t peer_pid(LocalSessionData* session) { return InvalidPid; }
@@ -1234,6 +1282,58 @@ class ArrowArrayBuilder<ArrowType, arrow::enable_if_base_binary<ArrowType>>
 	}
 };
 
+/* NUMERIC → float64 builder.  PG's NUMERIC is variable-precision so we
+ * convert via the built-in numeric_float8 cast (lossy but practical). */
+class NumericToDoubleBuilder : public ArrowArrayBuilderBase {
+   public:
+	NumericToDoubleBuilder(Form_pg_attribute attribute,
+	                       int iAttribute,
+	                       arrow::ArrayBuilder* builder)
+		: ArrowArrayBuilderBase(attribute, iAttribute),
+		  builder_(static_cast<arrow::DoubleBuilder*>(builder))
+	{
+	}
+
+   private:
+	arrow::DoubleBuilder* builder_;
+
+	static double numeric_to_double(Datum datum)
+	{
+		return DatumGetFloat8(DirectFunctionCall1(numeric_float8, datum));
+	}
+
+	arrow::Status build_not_null(uint64_t iTuple, uint64_t iTupleEnd) override
+	{
+		for (uint64_t i = iTuple; i < iTupleEnd; ++i)
+		{
+			bool isNull;
+			auto datum = SPI_getbinval(SPI_tuptable->vals[i],
+			                           SPI_tuptable->tupdesc,
+			                           iAttribute_ + 1,
+			                           &isNull);
+			ARROW_RETURN_NOT_OK(builder_->Append(numeric_to_double(datum)));
+		}
+		return arrow::Status::OK();
+	}
+
+	arrow::Status build_may_null(uint64_t iTuple, uint64_t iTupleEnd) override
+	{
+		for (uint64_t i = iTuple; i < iTupleEnd; ++i)
+		{
+			bool isNull;
+			auto datum = SPI_getbinval(SPI_tuptable->vals[i],
+			                           SPI_tuptable->tupdesc,
+			                           iAttribute_ + 1,
+			                           &isNull);
+			if (isNull)
+				ARROW_RETURN_NOT_OK(builder_->AppendNull());
+			else
+				ARROW_RETURN_NOT_OK(builder_->Append(numeric_to_double(datum)));
+		}
+		return arrow::Status::OK();
+	}
+};
+
 arrow::Result<std::unique_ptr<ArrowArrayBuilderBase>>
 ArrowArrayBuilderBase::make(Form_pg_attribute attribute,
                             int iAttribute,
@@ -1255,6 +1355,9 @@ ArrowArrayBuilderBase::make(Form_pg_attribute attribute,
 				attribute, iAttribute, builder);
 		case FLOAT8OID:
 			return std::make_unique<ArrowArrayBuilder<arrow::DoubleType>>(
+				attribute, iAttribute, builder);
+		case NUMERICOID:
+			return std::make_unique<NumericToDoubleBuilder>(
 				attribute, iAttribute, builder);
 		case VARCHAROID:
 		case TEXTOID:
@@ -1286,6 +1389,7 @@ ArrowArrayBuilderBase::arrow_type(Form_pg_attribute attribute)
 		case FLOAT4OID:
 			return arrow::float32();
 		case FLOAT8OID:
+		case NUMERICOID:
 			return arrow::float64();
 		case VARCHAROID:
 		case TEXTOID:
@@ -1589,6 +1693,14 @@ class Executor : public WorkerProcessor {
 		{
 			switch (action)
 			{
+				// [ML] here we would remove all these calls
+				// We would have only one call, say Action::Substrait
+				// this would deserialise the protobuf message
+				// build a query object and pass it directly to postgres
+				// for now, let us assume we only have "select" substrait plans
+				// once we have executed the select substait plan,
+				// we pass it back to the original code here and have it serialised into
+				// arrow format
 				case Action::Select:
 					select();
 					break;
@@ -1609,6 +1721,9 @@ class Executor : public WorkerProcessor {
 					break;
 				case Action::UpdatePreparedStatement:
 					update_prepared_statement();
+					break;
+				case Action::SubstraitSelect:
+					select_substrait();
 					break;
 				default:
 					// TODO: Report an error
@@ -1924,6 +2039,115 @@ class Executor : public WorkerProcessor {
 			}
 			SPI_finish();
 			needFinish_ = false;
+			signal_server(tag);
+		}
+	}
+
+	void select_substrait()
+	{
+		const char* tag = "select_substrait";
+		pgstat_report_activity(
+			STATE_RUNNING,
+			(std::string(Tag) + ": executing substrait plan").c_str());
+
+		auto session = find_session();
+		SharedSessionReleaser sessionReleaser(sessions_, session);
+		if (!DsaPointerIsValid(session->substraitPlan))
+		{
+			set_error_message(
+				session,
+				std::string(Tag) + ": " + tag_ + ": " + tag +
+					": substrait plan is missing",
+				tag);
+			return;
+		}
+
+		const uint8_t* planData;
+		size_t planSize;
+		{
+			ProcessorLockGuard lock(this);
+			planData = static_cast<const uint8_t*>(
+				dsa_get_address(area_, session->substraitPlan));
+			planSize = session->substraitPlanSize;
+		}
+
+		P("%s: %s: %s: plan size: %" PRIsize, Tag, tag_, tag, planSize);
+
+		{
+			ScopedTransaction scopedTransaction;
+			ScopedSnapshot scopedSnapshot;
+
+			SetCurrentStatementStartTimestamp();
+
+			Query* query = substrait_to_query(planData, planSize);
+			PlannedStmt* pstmt = standard_planner(query, "<substrait>", 0, NULL);
+
+			PushActiveSnapshot(GetTransactionSnapshot());
+			QueryDesc* qdesc = CreateQueryDesc(pstmt,
+			                                   "<substrait>",
+			                                   GetActiveSnapshot(),
+			                                   InvalidSnapshot,
+			                                   None_Receiver,
+			                                   NULL,
+			                                   NULL,
+			                                   0);
+			ExecutorStart(qdesc, EXEC_FLAG_SKIP_TRIGGERS);
+
+			TupleDesc tupdesc = qdesc->tupDesc;
+			std::vector<HeapTuple> tuples;
+			for (;;)
+			{
+				TupleTableSlot* slot = ExecProcNode(qdesc->planstate);
+				if (TupIsNull(slot))
+					break;
+				tuples.push_back(ExecCopySlotHeapTuple(slot));
+			}
+
+			// Temporarily set SPI globals so write_record_batches() can
+			// read tuples via SPI_tuptable / SPI_processed.
+			SPITupleTable fakeTupleTable;
+			memset(&fakeTupleTable, 0, sizeof(fakeTupleTable));
+			fakeTupleTable.tupdesc = tupdesc;
+			fakeTupleTable.vals = tuples.data();
+
+			auto savedTupleTable = SPI_tuptable;
+			auto savedProcessed = SPI_processed;
+			SPI_tuptable = &fakeTupleTable;
+			SPI_processed = tuples.size();
+
+			pgstat_report_activity(
+				STATE_RUNNING,
+				(std::string(Tag) + ": " + tag + ": writing").c_str());
+			auto status = write_record_batches(tag);
+
+			SPI_tuptable = savedTupleTable;
+			SPI_processed = savedProcessed;
+
+			if (!status.ok())
+			{
+				set_error_message(
+					session,
+					std::string(Tag) + ": " + tag_ + ": " + tag +
+						": failed to write: " + status.ToString(),
+					tag);
+			}
+
+			for (auto& tuple : tuples)
+				pfree(tuple);
+
+			ExecutorFinish(qdesc);
+			ExecutorEnd(qdesc);
+			PopActiveSnapshot();
+			FreeQueryDesc(qdesc);
+
+			// Free the shared memory plan data
+			{
+				ProcessorLockGuard lock(this);
+				dsa_free(area_, session->substraitPlan);
+				session->substraitPlan = InvalidDsaPointer;
+				session->substraitPlanSize = 0;
+			}
+
 			signal_server(tag);
 		}
 	}
@@ -2445,6 +2669,7 @@ class Proxy : public WorkerProcessor {
 	{
 		process_connect_requests();
 		process_select_requests();
+		process_substrait_select_requests();
 		process_update_requests();
 		process_prepare_requests();
 		process_close_prepared_statement_requests();
@@ -2686,6 +2911,56 @@ class Proxy : public WorkerProcessor {
 
 	std::list<std::shared_ptr<SelectRequest>> selectRequests_;
 
+	struct SubstraitSelectRequest {
+		SubstraitSelectRequest(std::shared_ptr<LocalSessionData> localSession,
+		                       std::string plan)
+			: localSession(std::move(localSession)),
+			  plan(std::move(plan)),
+			  finished(false)
+		{
+		}
+		std::shared_ptr<LocalSessionData> localSession;
+		std::string plan;  // raw protobuf bytes (stored as std::string)
+		bool finished;
+	};
+
+	std::list<std::shared_ptr<SubstraitSelectRequest>> substraitSelectRequests_;
+
+	// Can use PostgreSQL API.
+	void process_substrait_select_requests()
+	{
+#ifdef AFS_VERBOSE
+		const char* tag = "substrait_select";
+#endif
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (auto& request : substraitSelectRequests_)
+		{
+			request->finished = true;
+			auto session = static_cast<SharedSessionData*>(
+				dshash_find(sessions_, &(request->localSession->id), false));
+			if (!session)
+			{
+				request->localSession->errorMessage =
+					std::string("stolen session: ") +
+					std::to_string(request->localSession->id);
+				continue;
+			}
+			auto executorPID = session->executorPID;
+			{
+				SharedSessionReleaser sessionReleaser(sessions_, session);
+				ProcessorLockGuard lock(this);
+				set_shared_bytes(session->substraitPlan,
+				                 request->plan.data(),
+				                 request->plan.size());
+				session->substraitPlanSize = request->plan.size();
+				session->action = Action::SubstraitSelect;
+			}
+			P("%s: %s: %s: kill executor: %d", Tag, tag_, tag, executorPID);
+			kill(executorPID, SIGUSR1);
+		}
+		substraitSelectRequests_.clear();
+	}
+
 	// Can use PostgreSQL API.
 	void process_select_requests()
 	{
@@ -2750,6 +3025,44 @@ class Proxy : public WorkerProcessor {
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			selectRequests_.push_back(request);
+		}
+		kill(MyProcPid, SIGUSR1);
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			conditionVariable_.wait(lock, [&] {
+				if (localSession->errorMessage.has_value())
+				{
+					return true;
+				}
+				if (INTERRUPTS_PENDING_CONDITION())
+				{
+					return true;
+				}
+				return request->finished;
+			});
+		}
+		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
+		if (INTERRUPTS_PENDING_CONDITION())
+		{
+			return arrow::Status::Invalid("interrupted");
+		}
+		P("%s: %s: %s: open", Tag, tag_, tag);
+		auto schema = read_schema(localSession, tag);
+		P("%s: %s: %s: schema", Tag, tag_, tag);
+		return schema;
+	}
+
+	// Don't use PostgreSQL API.
+	arrow::Result<std::shared_ptr<arrow::Schema>> substrait_select(
+		uint64_t sessionID, const std::string& plan)
+	{
+		const char* tag = "substrait_select";
+		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(sessionID));
+		auto request =
+			std::make_shared<SubstraitSelectRequest>(localSession, plan);
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			substraitSelectRequests_.push_back(request);
 		}
 		kill(MyProcPid, SIGUSR1);
 		{
@@ -4085,6 +4398,27 @@ class FlightSQLServer : public arrow::flight::sql::FlightSqlServerBase {
 		ARROW_ASSIGN_OR_RAISE(auto schema, proxy_->select(sessionID, query));
 		ARROW_ASSIGN_OR_RAISE(auto ticket,
 		                      arrow::flight::sql::CreateStatementQueryTicket(query));
+		std::vector<arrow::flight::FlightEndpoint> endpoints{
+			create_endpoint(std::move(ticket))};
+		ARROW_ASSIGN_OR_RAISE(
+			auto result,
+			arrow::flight::FlightInfo::Make(*schema, descriptor, endpoints, -1, -1));
+		return std::make_unique<arrow::flight::FlightInfo>(result);
+	}
+
+	arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> GetFlightInfoSubstraitPlan(
+		const arrow::flight::ServerCallContext& context,
+		const arrow::flight::sql::StatementSubstraitPlan& command,
+		const arrow::flight::FlightDescriptor& descriptor) override
+	{
+		ARROW_ASSIGN_OR_RAISE(auto sessionID, session_id(context));
+		const auto& plan = command.plan.plan;
+		ARROW_ASSIGN_OR_RAISE(auto schema,
+		                      proxy_->substrait_select(sessionID, plan));
+		// Use a fixed ticket identifier for substrait queries
+		ARROW_ASSIGN_OR_RAISE(
+			auto ticket,
+			arrow::flight::sql::CreateStatementQueryTicket("substrait"));
 		std::vector<arrow::flight::FlightEndpoint> endpoints{
 			create_endpoint(std::move(ticket))};
 		ARROW_ASSIGN_OR_RAISE(
