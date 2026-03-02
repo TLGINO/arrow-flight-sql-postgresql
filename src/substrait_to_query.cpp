@@ -258,40 +258,6 @@ read_rel_to_rte(const substrait::ReadRel &read,
     return rte;
 }
 
-/* Recursively process a base relation tree (Read or nested Cross).
- * Each ReadRel becomes an RTE; CrossRel concatenates left+right schemas. */
-static void
-process_base_rel(const substrait::Rel &rel, Query *query,
-                 SubstraitSchema &schema_out)
-{
-    if (rel.has_read())
-    {
-        SubstraitSchema local;
-        RangeTblEntry *rte = read_rel_to_rte(rel.read(), local, query);
-        query->rtable = lappend(query->rtable, rte);
-        int rtindex = list_length(query->rtable);
-
-        RangeTblRef *rtr = makeNode(RangeTblRef);
-        rtr->rtindex = rtindex;
-        query->jointree->fromlist = lappend(query->jointree->fromlist, rtr);
-
-        for (auto &[rt, attnum, typeoid] : local)
-            rt = rtindex;
-        schema_out.insert(schema_out.end(), local.begin(), local.end());
-    }
-    else if (rel.has_cross())
-    {
-        const auto &cross = rel.cross();
-        process_base_rel(cross.left(), query, schema_out);
-        process_base_rel(cross.right(), query, schema_out);
-    }
-    else
-    {
-        ereport(ERROR,
-                (errmsg("substrait: unsupported base relation type")));
-    }
-}
-
 /* Virtual expression map: field_index → precomputed PG Expr.
  * Used for inner ProjectRel computed columns. */
 typedef std::unordered_map<int, Expr *> VirtualMap;
@@ -302,6 +268,133 @@ convert_expression(const substrait::Expression &expr,
                    const SubstraitSchema &schema,
                    const FuncMap &func_map,
                    const VirtualMap &virtuals = {});
+
+/* Build a from-list Node for a base relation tree.
+ * Adds RTEs to rtable. Returns a single Node* for Read/Join;
+ * for Cross, adds children to fromlist directly and returns NULL. */
+static Node *
+build_from_node(const substrait::Rel &rel, Query *query,
+                SubstraitSchema &schema_out, const FuncMap &func_map)
+{
+    if (rel.has_read())
+    {
+        SubstraitSchema local;
+        RangeTblEntry *rte = read_rel_to_rte(rel.read(), local, query);
+        query->rtable = lappend(query->rtable, rte);
+        int rtindex = list_length(query->rtable);
+
+        for (auto &[rt, attnum, typeoid] : local)
+            rt = rtindex;
+        schema_out.insert(schema_out.end(), local.begin(), local.end());
+
+        RangeTblRef *rtr = makeNode(RangeTblRef);
+        rtr->rtindex = rtindex;
+        return (Node *)rtr;
+    }
+    else if (rel.has_cross())
+    {
+        const auto &cross = rel.cross();
+        Node *l = build_from_node(cross.left(), query, schema_out, func_map);
+        if (l)
+            query->jointree->fromlist = lappend(query->jointree->fromlist, l);
+        Node *r = build_from_node(cross.right(), query, schema_out, func_map);
+        if (r)
+            query->jointree->fromlist = lappend(query->jointree->fromlist, r);
+        return NULL;
+    }
+    else if (rel.has_join())
+    {
+        const auto &jn = rel.join();
+        SubstraitSchema left_schema, right_schema;
+
+        Node *larg = build_from_node(jn.left(), query, left_schema, func_map);
+        Node *rarg = build_from_node(jn.right(), query, right_schema, func_map);
+
+        /* Combined schema for join condition resolution. */
+        SubstraitSchema combined = left_schema;
+        combined.insert(combined.end(), right_schema.begin(),
+                        right_schema.end());
+
+        JoinType pg_jtype;
+        switch (jn.type())
+        {
+            case substrait::JoinRel::JOIN_TYPE_INNER:
+                pg_jtype = JOIN_INNER; break;
+            case substrait::JoinRel::JOIN_TYPE_LEFT:
+                pg_jtype = JOIN_LEFT; break;
+            case substrait::JoinRel::JOIN_TYPE_RIGHT:
+                pg_jtype = JOIN_RIGHT; break;
+            case substrait::JoinRel::JOIN_TYPE_OUTER:
+                pg_jtype = JOIN_FULL; break;
+            default:
+                ereport(ERROR,
+                        (errmsg("substrait: unsupported join type %d",
+                                jn.type())));
+        }
+
+        Node *quals = NULL;
+        if (jn.has_expression())
+            quals = (Node *)convert_expression(jn.expression(),
+                                               combined, func_map);
+
+        /* RTE_JOIN entry for the planner. */
+        List *alias_vars = NIL;
+        List *col_names = NIL;
+        for (auto &[rt, attnum, typeoid] : combined)
+        {
+            Oid collation = is_string_type(typeoid)
+                ? DEFAULT_COLLATION_OID : InvalidOid;
+            alias_vars = lappend(alias_vars,
+                makeVar(rt, attnum, typeoid, -1, collation, 0));
+            col_names = lappend(col_names,
+                makeString(pstrdup("?column?")));
+        }
+
+        RangeTblEntry *join_rte = makeNode(RangeTblEntry);
+        join_rte->rtekind = RTE_JOIN;
+        join_rte->jointype = pg_jtype;
+        join_rte->joinmergedcols = 0;
+        join_rte->joinaliasvars = alias_vars;
+        join_rte->joinleftcols = NIL;
+        join_rte->joinrightcols = NIL;
+        join_rte->join_using_alias = NULL;
+        join_rte->eref = makeAlias(pstrdup("unnamed_join"), col_names);
+        join_rte->lateral = false;
+        join_rte->inh = false;
+        join_rte->inFromCl = true;
+
+        query->rtable = lappend(query->rtable, join_rte);
+        int join_rtindex = list_length(query->rtable);
+
+        JoinExpr *jexpr = makeNode(JoinExpr);
+        jexpr->jointype = pg_jtype;
+        jexpr->isNatural = false;
+        jexpr->larg = larg;
+        jexpr->rarg = rarg;
+        jexpr->usingClause = NIL;
+        jexpr->join_using_alias = NULL;
+        jexpr->quals = quals;
+        jexpr->alias = NULL;
+        jexpr->rtindex = join_rtindex;
+
+        schema_out = combined;
+        return (Node *)jexpr;
+    }
+
+    ereport(ERROR,
+            (errmsg("substrait: unsupported base relation type")));
+    return NULL;
+}
+
+/* Top-level: process base relation tree into query->jointree->fromlist. */
+static void
+process_base_rel(const substrait::Rel &rel, Query *query,
+                 SubstraitSchema &schema_out, const FuncMap &func_map)
+{
+    Node *node = build_from_node(rel, query, schema_out, func_map);
+    if (node)
+        query->jointree->fromlist = lappend(query->jointree->fromlist, node);
+}
 
 /* ============================================================
  * SECTION 4 - AggregateRel to targetList
@@ -482,9 +575,15 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
                 converted_args.push_back(e);
                 argtypes.push_back(exprType((Node *)e));
             }
-            List *funcname = list_make1(makeString(pstrdup(pg_agg.c_str())));
-            aggfnoid = LookupFuncName(funcname, (int)argtypes.size(),
-                                      argtypes.data(), false);
+            /* count("any") — polymorphic, same pg_proc entry as count(*). */
+            if (pg_agg == "count")
+                aggfnoid = lookup_count_star();
+            else
+            {
+                List *funcname = list_make1(makeString(pstrdup(pg_agg.c_str())));
+                aggfnoid = LookupFuncName(funcname, (int)argtypes.size(),
+                                          argtypes.data(), false);
+            }
         }
 
         HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(aggfnoid));
@@ -1109,22 +1208,15 @@ convert_expression(const substrait::Expression &expr,
 
 /* ============================================================
  * SECTION 6 - Top-level entry point
+ *
+ * build_query_for_rel: recursive core — builds a Query* from a Rel chain.
+ * substrait_to_query: extern "C" entry — parses protobuf, delegates.
  * ============================================================ */
 
-extern "C" Query *
-substrait_to_query(const uint8_t *data, size_t len)
+static Query *
+build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
+                    const substrait::RelRoot *root)
 {
-    substrait::Plan plan;
-    if (!plan.ParseFromArray(data, (int)len))
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("substrait: failed to deserialize protobuf Plan")));
-
-    if (plan.relations_size() == 0)
-        ereport(ERROR, (errmsg("substrait: plan contains no relations")));
-
-    FuncMap func_map = build_func_map(plan);
-
     Query *query = makeNode(Query);
     query->commandType = CMD_SELECT;
     query->querySource = QSRC_ORIGINAL;
@@ -1135,14 +1227,8 @@ substrait_to_query(const uint8_t *data, size_t len)
     query->jointree->fromlist = NIL;
     query->jointree->quals = NULL;
 
-    const substrait::PlanRel &prel = plan.relations(0);
-    const substrait::Rel &root_rel =
-        prel.has_root() ? prel.root().input() : prel.rel();
-
-    const substrait::Rel *cur = &root_rel;
-
     /* Peel relations outermost-first.
-     * [Fetch?] > [Sort?] > [Project?] > [Aggregate?] > [Project?] > [Filter?] > Read|Cross */
+     * [Fetch?] > [Sort?] > [Project?] > [Aggregate?] > [Project?] > [Filter?] > base */
     const substrait::FetchRel *fetch_rel = nullptr;
     if (cur->has_fetch())
     {
@@ -1186,108 +1272,181 @@ substrait_to_query(const uint8_t *data, size_t len)
         cur = &filter_rel->input();
     }
 
-    if (!cur->has_read() && !cur->has_cross())
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("substrait: unsupported plan shape")));
-
+    /* --- Base relation or subquery --- */
     SubstraitSchema schema;
-    process_base_rel(*cur, query, schema);
-
-    /* Apply filter: either from standalone FilterRel or ReadRel.filter.
-     * Filter operates on the base schema (before projection). */
-    if (filter_rel != nullptr)
-    {
-        query->jointree->quals = (Node *)convert_expression(
-            filter_rel->condition(), schema, func_map);
-    }
-    else if (cur->has_read() && cur->read().has_filter())
-    {
-        query->jointree->quals = (Node *)convert_expression(
-            cur->read().filter(), schema, func_map);
-    }
-
-    /* Apply ReadRel projection: remap schema for upstream operators.
-     * ReadRel.projection narrows/reorders columns; operators above
-     * (aggregate, project) reference the projected field indices. */
-    SubstraitSchema projected_schema = schema;
-    if (cur->has_read())
-    {
-        const auto &read = cur->read();
-        if (read.has_projection() &&
-            read.projection().has_select())
-        {
-            const auto &sel = read.projection().select();
-            projected_schema.clear();
-            for (int i = 0; i < sel.struct_items_size(); i++)
-            {
-                int base_idx = sel.struct_items(i).field();
-                if (base_idx >= 0 && base_idx < (int)schema.size())
-                    projected_schema.push_back(schema[base_idx]);
-            }
-        }
-    }
-
-    /* Inner ProjectRel: precompute expressions that the aggregate
-     * references. The ProjectRel output is (input cols + expression cols),
-     * then optionally reordered by emit.outputMapping.
-     *
-     * We build a combined column map indexed by the output position.
-     * Real columns use the projected_schema; virtual columns are stored
-     * in a position-indexed map so convert_expression can return them. */
+    SubstraitSchema projected_schema;
     VirtualMap virtual_map;
-    if (inner_project_rel != nullptr)
+
+    bool is_base = cur->has_read() || cur->has_cross() || cur->has_join();
+
+    if (is_base)
     {
-        /* Build virtual expressions from the projected_schema context. */
-        std::vector<Expr *> raw_virtuals;
-        for (int i = 0; i < inner_project_rel->expressions_size(); i++)
+        process_base_rel(*cur, query, schema, func_map);
+
+        /* Apply filter */
+        if (filter_rel != nullptr)
         {
-            raw_virtuals.push_back(convert_expression(
-                inner_project_rel->expressions(i),
-                projected_schema, func_map));
+            query->jointree->quals = (Node *)convert_expression(
+                filter_rel->condition(), schema, func_map);
+        }
+        else if (cur->has_read() && cur->read().has_filter())
+        {
+            query->jointree->quals = (Node *)convert_expression(
+                cur->read().filter(), schema, func_map);
         }
 
-        int n_input = (int)projected_schema.size();
-
-        if (inner_project_rel->has_common() &&
-            inner_project_rel->common().has_emit())
+        /* Apply ReadRel projection */
+        projected_schema = schema;
+        if (cur->has_read())
         {
-            /* Emit.outputMapping reorders (input cols + expr cols). */
-            const auto &mapping =
-                inner_project_rel->common().emit().output_mapping();
-
-            SubstraitSchema new_schema;
-            for (int i = 0; i < mapping.size(); i++)
+            const auto &read = cur->read();
+            if (read.has_projection() &&
+                read.projection().has_select())
             {
-                int src = mapping.Get(i);
-                if (src < n_input)
+                const auto &sel = read.projection().select();
+                projected_schema.clear();
+                for (int i = 0; i < sel.struct_items_size(); i++)
                 {
-                    new_schema.push_back(projected_schema[src]);
-                }
-                else
-                {
-                    Expr *ve = raw_virtuals[src - n_input];
-                    new_schema.push_back({0, 0, exprType((Node *)ve)});
-                    virtual_map[i] = ve;
+                    int base_idx = sel.struct_items(i).field();
+                    if (base_idx >= 0 && base_idx < (int)schema.size())
+                        projected_schema.push_back(schema[base_idx]);
                 }
             }
-            projected_schema = new_schema;
         }
-        else
+
+        /* Inner ProjectRel */
+        if (inner_project_rel != nullptr)
         {
-            /* No emit — virtuals are appended after input columns. */
-            for (size_t i = 0; i < raw_virtuals.size(); i++)
+            std::vector<Expr *> raw_virtuals;
+            for (int i = 0; i < inner_project_rel->expressions_size(); i++)
             {
-                Expr *ve = raw_virtuals[i];
-                projected_schema.push_back({0, 0, exprType((Node *)ve)});
-                virtual_map[n_input + (int)i] = ve;
+                raw_virtuals.push_back(convert_expression(
+                    inner_project_rel->expressions(i),
+                    projected_schema, func_map));
+            }
+
+            int n_input = (int)projected_schema.size();
+
+            if (inner_project_rel->has_common() &&
+                inner_project_rel->common().has_emit())
+            {
+                const auto &mapping =
+                    inner_project_rel->common().emit().output_mapping();
+
+                SubstraitSchema new_schema;
+                for (int i = 0; i < mapping.size(); i++)
+                {
+                    int src = mapping.Get(i);
+                    if (src < n_input)
+                    {
+                        new_schema.push_back(projected_schema[src]);
+                    }
+                    else
+                    {
+                        Expr *ve = raw_virtuals[src - n_input];
+                        new_schema.push_back({0, 0, exprType((Node *)ve)});
+                        virtual_map[i] = ve;
+                    }
+                }
+                projected_schema = new_schema;
+            }
+            else
+            {
+                for (size_t i = 0; i < raw_virtuals.size(); i++)
+                {
+                    Expr *ve = raw_virtuals[i];
+                    projected_schema.push_back({0, 0, exprType((Node *)ve)});
+                    virtual_map[n_input + (int)i] = ve;
+                }
+            }
+        }
+    }
+    else
+    {
+        /* Nested rel chain (e.g., another Aggregate) — build as subquery. */
+        Query *subq = build_query_for_rel(cur, func_map, nullptr);
+
+        RangeTblEntry *sub_rte = makeNode(RangeTblEntry);
+        sub_rte->rtekind = RTE_SUBQUERY;
+        sub_rte->subquery = subq;
+        sub_rte->lateral = false;
+        sub_rte->inh = false;
+        sub_rte->inFromCl = true;
+
+        List *colnames = NIL;
+        int attno = 1;
+        ListCell *lc;
+        foreach(lc, subq->targetList)
+        {
+            TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            colnames = lappend(colnames,
+                makeString(pstrdup(tle->resname ? tle->resname : "?column?")));
+            Oid t = exprType((Node *)tle->expr);
+            projected_schema.push_back({0, (AttrNumber)attno, t});
+            attno++;
+        }
+        sub_rte->eref = makeAlias(pstrdup("subq"), colnames);
+
+        query->rtable = lappend(query->rtable, sub_rte);
+        int sub_rtindex = list_length(query->rtable);
+
+        for (auto &[rt, attnum, typeoid] : projected_schema)
+            rt = sub_rtindex;
+        schema = projected_schema;
+
+        RangeTblRef *rtr = makeNode(RangeTblRef);
+        rtr->rtindex = sub_rtindex;
+        query->jointree->fromlist = lappend(query->jointree->fromlist, rtr);
+
+        /* Apply inner_project on subquery output if present. */
+        if (inner_project_rel != nullptr)
+        {
+            std::vector<Expr *> raw_virtuals;
+            for (int i = 0; i < inner_project_rel->expressions_size(); i++)
+            {
+                raw_virtuals.push_back(convert_expression(
+                    inner_project_rel->expressions(i),
+                    projected_schema, func_map));
+            }
+
+            int n_input = (int)projected_schema.size();
+
+            if (inner_project_rel->has_common() &&
+                inner_project_rel->common().has_emit())
+            {
+                const auto &mapping =
+                    inner_project_rel->common().emit().output_mapping();
+
+                SubstraitSchema new_schema;
+                for (int i = 0; i < mapping.size(); i++)
+                {
+                    int src = mapping.Get(i);
+                    if (src < n_input)
+                    {
+                        new_schema.push_back(projected_schema[src]);
+                    }
+                    else
+                    {
+                        Expr *ve = raw_virtuals[src - n_input];
+                        new_schema.push_back({0, 0, exprType((Node *)ve)});
+                        virtual_map[i] = ve;
+                    }
+                }
+                projected_schema = new_schema;
+            }
+            else
+            {
+                for (size_t i = 0; i < raw_virtuals.size(); i++)
+                {
+                    Expr *ve = raw_virtuals[i];
+                    projected_schema.push_back({0, 0, exprType((Node *)ve)});
+                    virtual_map[n_input + (int)i] = ve;
+                }
             }
         }
     }
 
-    /* Schema/virtuals for the outer project — depends on whether there's
-     * an aggregate (outer project references aggregate output, not inner
-     * schema) or not (references projected_schema directly). */
+    /* --- Aggregate --- */
     SubstraitSchema outer_schema = projected_schema;
     VirtualMap outer_virtuals;
 
@@ -1296,8 +1455,6 @@ substrait_to_query(const uint8_t *data, size_t len)
         query->targetList = aggregate_rel_to_targetlist(
             *agg_rel, query, projected_schema, func_map, virtual_map);
 
-        /* Build aggregate output schema: each target entry becomes a
-         * virtual expression so the outer project can reference it. */
         outer_schema.clear();
         ListCell *lc;
         int idx = 0;
@@ -1309,21 +1466,17 @@ substrait_to_query(const uint8_t *data, size_t len)
             outer_virtuals[idx++] = tle->expr;
         }
     }
-    else
+    else if (!schema.empty())
     {
-        /* Single-table star select — get rtindex from first schema entry. */
         auto [rt0, att0, typ0] = schema[0];
         RangeTblEntry *rte =
             (RangeTblEntry *)list_nth(query->rtable, rt0 - 1);
         query->targetList = build_star_tlist(rte, rt0);
     }
 
-    /* ProjectRel: append computed expressions to target list.
-     * Substrait ProjectRel output = input columns + expression columns.
-     * The root RelRoot.names gives the final column names. */
+    /* --- Outer ProjectRel --- */
     if (project_rel != nullptr && project_rel->expressions_size() > 0)
     {
-        const substrait::PlanRel &pr = plan.relations(0);
         int name_idx = list_length(query->targetList);
 
         for (int i = 0; i < project_rel->expressions_size(); i++)
@@ -1333,8 +1486,8 @@ substrait_to_query(const uint8_t *data, size_t len)
                 func_map, outer_virtuals);
 
             const char *colname = "expr";
-            if (pr.has_root() && name_idx < pr.root().names_size())
-                colname = pr.root().names(name_idx).c_str();
+            if (root != nullptr && name_idx < root->names_size())
+                colname = root->names(name_idx).c_str();
 
             TargetEntry *tle = makeTargetEntry(
                 expr,
@@ -1345,9 +1498,6 @@ substrait_to_query(const uint8_t *data, size_t len)
             name_idx++;
         }
 
-        /* Outer project emit: rebuild target list with only emitted entries.
-         * Non-emitted aggregate TLEs are dropped — their Aggrefs are
-         * already embedded in the emitted expressions via outer_virtuals. */
         if (project_rel->has_common() &&
             project_rel->common().has_emit())
         {
@@ -1355,8 +1505,6 @@ substrait_to_query(const uint8_t *data, size_t len)
             List *old_tlist = query->targetList;
             int old_len = list_length(old_tlist);
 
-            /* Build map: old ressortgroupref → expression, so we can
-             * reassign GROUP BY refs to matching new TLEs. */
             std::unordered_map<Index, Expr *> sgref_expr;
             {
                 ListCell *lc;
@@ -1380,7 +1528,6 @@ substrait_to_query(const uint8_t *data, size_t len)
                     tle->resno = resno++;
                     tle->resjunk = false;
 
-                    /* Match against old grouping key expressions. */
                     for (auto &[ref, gexpr] : sgref_expr)
                     {
                         if (equal(tle->expr, gexpr))
@@ -1397,12 +1544,10 @@ substrait_to_query(const uint8_t *data, size_t len)
         }
     }
 
-    /* SortRel → query->sortClause.
-     * Sort field references index into the final target list. */
+    /* --- SortRel --- */
     if (sort_rel != nullptr)
     {
         Index next_sgref = 0;
-        /* Find max existing ressortgroupref (set by GROUP BY). */
         ListCell *lc;
         foreach (lc, query->targetList)
         {
@@ -1416,14 +1561,12 @@ substrait_to_query(const uint8_t *data, size_t len)
         {
             const auto &sf = sort_rel->sorts(i);
 
-            /* Resolve the sort expression to a target list entry. */
             if (!sf.has_expr() || !sf.expr().has_selection())
                 ereport(ERROR,
                         (errmsg("substrait: non-field sort expression")));
             int field_idx = sf.expr().selection()
                                 .direct_reference().struct_field().field();
 
-            /* Target list is 1-indexed; field_idx is 0-indexed. */
             if (field_idx < 0 || field_idx >= list_length(query->targetList))
                 ereport(ERROR,
                         (errmsg("substrait: sort field %d out of range",
@@ -1431,11 +1574,9 @@ substrait_to_query(const uint8_t *data, size_t len)
             TargetEntry *tle =
                 (TargetEntry *)list_nth(query->targetList, field_idx);
 
-            /* Assign ressortgroupref if not already set (by GROUP BY). */
             if (tle->ressortgroupref == 0)
                 tle->ressortgroupref = next_sgref++;
 
-            /* Determine sort direction. */
             bool is_desc = false;
             bool nulls_first = false;
             if (sf.has_direction())
@@ -1464,7 +1605,7 @@ substrait_to_query(const uint8_t *data, size_t len)
         }
     }
 
-    /* FetchRel → LIMIT / OFFSET */
+    /* --- FetchRel → LIMIT / OFFSET --- */
     if (fetch_rel != nullptr)
     {
         int64_t count = -1, offset = 0;
@@ -1484,4 +1625,28 @@ substrait_to_query(const uint8_t *data, size_t len)
     }
 
     return query;
+}
+
+extern "C" Query *
+substrait_to_query(const uint8_t *data, size_t len)
+{
+    substrait::Plan plan;
+    if (!plan.ParseFromArray(data, (int)len))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("substrait: failed to deserialize protobuf Plan")));
+
+    if (plan.relations_size() == 0)
+        ereport(ERROR, (errmsg("substrait: plan contains no relations")));
+
+    FuncMap func_map = build_func_map(plan);
+
+    const substrait::PlanRel &prel = plan.relations(0);
+    const substrait::Rel &root_rel =
+        prel.has_root() ? prel.root().input() : prel.rel();
+
+    const substrait::RelRoot *root =
+        prel.has_root() ? &prel.root() : nullptr;
+
+    return build_query_for_rel(&root_rel, func_map, root);
 }
