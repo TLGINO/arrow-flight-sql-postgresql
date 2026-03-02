@@ -739,6 +739,43 @@ convert_expression(const substrait::Expression &expr,
                 (errmsg("substrait: unsupported literal type")));
     }
 
+    /* --- IfThen → CaseExpr --- */
+    if (expr.has_if_then())
+    {
+        const auto &ift = expr.if_then();
+        CaseExpr *c = makeNode(CaseExpr);
+        c->casetype = InvalidOid; /* set below */
+        c->casecollid = InvalidOid;
+        c->arg = NULL; /* simple CASE (no test expr) */
+        c->args = NIL;
+        c->defresult = NULL;
+        c->location = -1;
+
+        for (int i = 0; i < ift.ifs_size(); i++)
+        {
+            const auto &clause = ift.ifs(i);
+            CaseWhen *w = makeNode(CaseWhen);
+            w->expr = convert_expression(clause.if_(), schema,
+                                         func_map, virtuals);
+            w->result = convert_expression(clause.then(), schema,
+                                           func_map, virtuals);
+            w->location = -1;
+            c->args = lappend(c->args, w);
+        }
+
+        if (ift.has_else_())
+            c->defresult = convert_expression(ift.else_(), schema,
+                                              func_map, virtuals);
+
+        /* Result type from first THEN branch. */
+        Oid rtype = exprType((Node *)((CaseWhen *)linitial(c->args))->result);
+        c->casetype = rtype;
+        if (is_string_type(rtype))
+            c->casecollid = DEFAULT_COLLATION_OID;
+
+        return (Expr *)c;
+    }
+
     /* --- Cast → convert input and apply PG coercion --- */
     if (expr.has_cast())
     {
@@ -1241,10 +1278,29 @@ substrait_to_query(const uint8_t *data, size_t len)
         }
     }
 
+    /* Schema/virtuals for the outer project — depends on whether there's
+     * an aggregate (outer project references aggregate output, not inner
+     * schema) or not (references projected_schema directly). */
+    SubstraitSchema outer_schema = projected_schema;
+    VirtualMap outer_virtuals;
+
     if (agg_rel != nullptr)
     {
         query->targetList = aggregate_rel_to_targetlist(
             *agg_rel, query, projected_schema, func_map, virtual_map);
+
+        /* Build aggregate output schema: each target entry becomes a
+         * virtual expression so the outer project can reference it. */
+        outer_schema.clear();
+        ListCell *lc;
+        int idx = 0;
+        foreach(lc, query->targetList)
+        {
+            TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            Oid otype = exprType((Node *)tle->expr);
+            outer_schema.push_back({0, 0, otype});
+            outer_virtuals[idx++] = tle->expr;
+        }
     }
     else
     {
@@ -1266,8 +1322,8 @@ substrait_to_query(const uint8_t *data, size_t len)
         for (int i = 0; i < project_rel->expressions_size(); i++)
         {
             Expr *expr = convert_expression(
-                project_rel->expressions(i), projected_schema,
-                func_map);
+                project_rel->expressions(i), outer_schema,
+                func_map, outer_virtuals);
 
             const char *colname = "expr";
             if (pr.has_root() && name_idx < pr.root().names_size())
@@ -1280,6 +1336,33 @@ substrait_to_query(const uint8_t *data, size_t len)
                 false);
             query->targetList = lappend(query->targetList, tle);
             name_idx++;
+        }
+
+        /* Outer project emit: rebuild target list with only emitted entries.
+         * Non-emitted aggregate TLEs are dropped — their Aggrefs are
+         * already embedded in the emitted expressions via outer_virtuals. */
+        if (project_rel->has_common() &&
+            project_rel->common().has_emit())
+        {
+            const auto &emit = project_rel->common().emit();
+            List *old_tlist = query->targetList;
+            int old_len = list_length(old_tlist);
+
+            List *new_tlist = NIL;
+            AttrNumber resno = 1;
+            for (int i = 0; i < emit.output_mapping_size(); i++)
+            {
+                int src = emit.output_mapping(i);
+                if (src < old_len)
+                {
+                    TargetEntry *tle = (TargetEntry *)
+                        copyObjectImpl(list_nth(old_tlist, src));
+                    tle->resno = resno++;
+                    tle->resjunk = false;
+                    new_tlist = lappend(new_tlist, tle);
+                }
+            }
+            query->targetList = new_tlist;
         }
     }
 

@@ -40,7 +40,7 @@ TPCH_DIR = os.path.join(SCRIPT_DIR, "tpch")
 # Features the converter currently handles.
 IMPLEMENTED = {"read", "aggregate", "project", "filter", "sort",
                "cast", "interval_day", "interval_year", "cross",
-               "like", "extract"}
+               "like", "extract", "if_then"}
 
 # TPC-H: features each query requires (from Isthmus plan analysis).
 TPCH_REQUIRES = {
@@ -203,6 +203,8 @@ def flight_exec_substrait(plan_bytes):
 def normalize_value(v):
     if isinstance(v, float):
         return round(v, 4)
+    if isinstance(v, str):
+        return v.strip()
     return v
 
 
