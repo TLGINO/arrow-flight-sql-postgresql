@@ -40,7 +40,8 @@ TPCH_DIR = os.path.join(SCRIPT_DIR, "tpch")
 # Features the converter currently handles.
 IMPLEMENTED = {"read", "aggregate", "project", "filter", "sort",
                "cast", "interval_day", "interval_year", "cross",
-               "like", "extract", "if_then", "fetch", "join"}
+               "like", "extract", "if_then", "fetch", "join",
+               "subquery"}
 
 # TPC-H: features each query requires (from Isthmus plan analysis).
 TPCH_REQUIRES = {

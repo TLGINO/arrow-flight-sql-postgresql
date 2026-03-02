@@ -86,6 +86,18 @@ extern "C"
  * SECTION 1 - Schema helpers
  * ============================================================ */
 
+static bool
+contains_sublink(Node *node)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, SubLink))
+        return true;
+    return expression_tree_walker(node,
+        (bool (*)()) contains_sublink, NULL);
+}
+
+
 /* (rtindex, attnum, typeoid) per field.
  * rtindex is 0 as placeholder in read_rel_to_rte; caller fixes up. */
 typedef std::vector<std::tuple<int, AttrNumber, Oid>> SubstraitSchema;
@@ -262,12 +274,18 @@ read_rel_to_rte(const substrait::ReadRel &read,
  * Used for inner ProjectRel computed columns. */
 typedef std::unordered_map<int, Expr *> VirtualMap;
 
-/* Forward declaration — defined in Section 5. */
+/* Forward declarations — defined in Sections 5 and 6. */
 static Expr *
 convert_expression(const substrait::Expression &expr,
                    const SubstraitSchema &schema,
                    const FuncMap &func_map,
-                   const VirtualMap &virtuals = {});
+                   const VirtualMap &virtuals = {},
+                   const SubstraitSchema *outer_schema = nullptr);
+
+static Query *
+build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
+                    const substrait::RelRoot *root,
+                    const SubstraitSchema *outer_schema = nullptr);
 
 /* Build a from-list Node for a base relation tree.
  * Adds RTEs to rtable. Returns a single Node* for Read/Join;
@@ -659,7 +677,8 @@ static Expr *
 convert_expression(const substrait::Expression &expr,
                    const SubstraitSchema &schema,
                    const FuncMap &func_map,
-                   const VirtualMap &virtuals)
+                   const VirtualMap &virtuals,
+                   const SubstraitSchema *outer_schema)
 {
     /* --- FieldReference → Var (or virtual expression) --- */
     if (expr.has_selection())
@@ -671,6 +690,22 @@ convert_expression(const substrait::Expression &expr,
                     (errmsg("substrait: unsupported field reference type")));
 
         int idx = sel.direct_reference().struct_field().field();
+
+        /* Outer reference: column from enclosing query (correlated subquery). */
+        if (sel.has_outer_reference())
+        {
+            if (!outer_schema || idx < 0 || idx >= (int)outer_schema->size())
+                ereport(ERROR,
+                        (errmsg("substrait: outer reference %d out of range",
+                                idx)));
+            auto [rt, attnum, typeoid] = (*outer_schema)[idx];
+            Oid collation = is_string_type(typeoid)
+                ? DEFAULT_COLLATION_OID : InvalidOid;
+            Var *v = makeVar(rt, attnum, typeoid, -1, collation, 0);
+            v->varlevelsup = sel.outer_reference().steps_out();
+            return (Expr *)v;
+        }
+
         if (idx < 0 || idx >= (int)schema.size())
             ereport(ERROR,
                     (errmsg("substrait: field index %d out of range", idx)));
@@ -685,6 +720,29 @@ convert_expression(const substrait::Expression &expr,
             ? DEFAULT_COLLATION_OID : InvalidOid;
 
         return (Expr *)makeVar(rt, attnum, typeoid, -1, collation, 0);
+    }
+
+    /* --- Subquery → SubLink --- */
+    if (expr.has_subquery())
+    {
+        const auto &sq = expr.subquery();
+        if (sq.has_scalar())
+        {
+            Query *subq = build_query_for_rel(
+                &sq.scalar().input(), func_map, nullptr, &schema);
+
+            SubLink *sl = makeNode(SubLink);
+            sl->subLinkType = EXPR_SUBLINK;
+            sl->subLinkId = 0;
+            sl->testexpr = NULL;
+            sl->operName = NIL;
+            sl->subselect = (Node *)subq;
+            sl->location = -1;
+            return (Expr *)sl;
+        }
+
+        ereport(ERROR,
+                (errmsg("substrait: unsupported subquery type")));
     }
 
     /* --- Literal → Const --- */
@@ -855,16 +913,16 @@ convert_expression(const substrait::Expression &expr,
             const auto &clause = ift.ifs(i);
             CaseWhen *w = makeNode(CaseWhen);
             w->expr = convert_expression(clause.if_(), schema,
-                                         func_map, virtuals);
+                                         func_map, virtuals, outer_schema);
             w->result = convert_expression(clause.then(), schema,
-                                           func_map, virtuals);
+                                           func_map, virtuals, outer_schema);
             w->location = -1;
             c->args = lappend(c->args, w);
         }
 
         if (ift.has_else_())
             c->defresult = convert_expression(ift.else_(), schema,
-                                              func_map, virtuals);
+                                              func_map, virtuals, outer_schema);
 
         /* Result type from first THEN branch. */
         Oid rtype = exprType((Node *)((CaseWhen *)linitial(c->args))->result);
@@ -883,7 +941,7 @@ convert_expression(const substrait::Expression &expr,
             ereport(ERROR, (errmsg("substrait: cast without input")));
 
         Expr *input = convert_expression(cast.input(), schema,
-                                         func_map, virtuals);
+                                         func_map, virtuals, outer_schema);
         Oid src_type = exprType((Node *)input);
 
         /* Map substrait target type to PG OID. */
@@ -1023,7 +1081,7 @@ convert_expression(const substrait::Expression &expr,
                 args = lappend(args,
                                convert_expression(arg.value(),
                                                   schema, func_map,
-                                                  virtuals));
+                                                  virtuals, outer_schema));
             }
             BoolExpr *be = makeNode(BoolExpr);
             be->boolop = btype;
@@ -1039,7 +1097,7 @@ convert_expression(const substrait::Expression &expr,
                         (errmsg("substrait: bad NOT expression")));
             List *args = list_make1(
                 convert_expression(sf.arguments(0).value(),
-                                   schema, func_map, virtuals));
+                                   schema, func_map, virtuals, outer_schema));
             BoolExpr *be = makeNode(BoolExpr);
             be->boolop = NOT_EXPR;
             be->args = args;
@@ -1055,7 +1113,7 @@ convert_expression(const substrait::Expression &expr,
                         (errmsg("substrait: bad null-test expression")));
             NullTest *nt = makeNode(NullTest);
             nt->arg = convert_expression(sf.arguments(0).value(),
-                                         schema, func_map, virtuals);
+                                         schema, func_map, virtuals, outer_schema);
             nt->nulltesttype = (fname == "is_null") ? IS_NULL : IS_NOT_NULL;
             nt->argisrow = false;
             nt->location = -1;
@@ -1069,9 +1127,9 @@ convert_expression(const substrait::Expression &expr,
                 ereport(ERROR,
                         (errmsg("substrait: like expects 2 args")));
             Expr *left = coerce_to_text(convert_expression(
-                sf.arguments(0).value(), schema, func_map, virtuals));
+                sf.arguments(0).value(), schema, func_map, virtuals, outer_schema));
             Expr *right = coerce_to_text(convert_expression(
-                sf.arguments(1).value(), schema, func_map, virtuals));
+                sf.arguments(1).value(), schema, func_map, virtuals, outer_schema));
 
             List *opname = list_make1(makeString(pstrdup("~~")));
             Oid opoid = LookupOperName(NULL, opname, TEXTOID, TEXTOID,
@@ -1111,7 +1169,7 @@ convert_expression(const substrait::Expression &expr,
             }
 
             Expr *date_arg = convert_expression(sf.arguments(1).value(),
-                                                schema, func_map, virtuals);
+                                                schema, func_map, virtuals, outer_schema);
             Expr *field_text = (Expr *)makeConst(
                 TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
                 PointerGetDatum(cstring_to_text(field_name)),
@@ -1146,10 +1204,10 @@ convert_expression(const substrait::Expression &expr,
 
             Expr *left = convert_expression(sf.arguments(0).value(),
                                             schema, func_map,
-                                            virtuals);
+                                            virtuals, outer_schema);
             Expr *right = convert_expression(sf.arguments(1).value(),
                                              schema, func_map,
-                                             virtuals);
+                                             virtuals, outer_schema);
 
             Oid lefttype = exprType((Node *)left);
             Oid righttype = exprType((Node *)right);
@@ -1215,7 +1273,8 @@ convert_expression(const substrait::Expression &expr,
 
 static Query *
 build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
-                    const substrait::RelRoot *root)
+                    const substrait::RelRoot *root,
+                    const SubstraitSchema *outer_schema)
 {
     Query *query = makeNode(Query);
     query->commandType = CMD_SELECT;
@@ -1287,12 +1346,12 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
         if (filter_rel != nullptr)
         {
             query->jointree->quals = (Node *)convert_expression(
-                filter_rel->condition(), schema, func_map);
+                filter_rel->condition(), schema, func_map, {}, outer_schema);
         }
         else if (cur->has_read() && cur->read().has_filter())
         {
             query->jointree->quals = (Node *)convert_expression(
-                cur->read().filter(), schema, func_map);
+                cur->read().filter(), schema, func_map, {}, outer_schema);
         }
 
         /* Apply ReadRel projection */
@@ -1364,7 +1423,7 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
     else
     {
         /* Nested rel chain (e.g., another Aggregate) — build as subquery. */
-        Query *subq = build_query_for_rel(cur, func_map, nullptr);
+        Query *subq = build_query_for_rel(cur, func_map, nullptr, outer_schema);
 
         RangeTblEntry *sub_rte = makeNode(RangeTblEntry);
         sub_rte->rtekind = RTE_SUBQUERY;
@@ -1446,8 +1505,16 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
         }
     }
 
+    /* Apply filter when base was a subquery (e.g. HAVING on aggregate subquery). */
+    if (!is_base && filter_rel != nullptr && query->jointree->quals == NULL)
+    {
+        query->jointree->quals = (Node *)convert_expression(
+            filter_rel->condition(), projected_schema, func_map,
+            virtual_map, outer_schema);
+    }
+
     /* --- Aggregate --- */
-    SubstraitSchema outer_schema = projected_schema;
+    SubstraitSchema project_input_schema = projected_schema;
     VirtualMap outer_virtuals;
 
     if (agg_rel != nullptr)
@@ -1455,23 +1522,37 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
         query->targetList = aggregate_rel_to_targetlist(
             *agg_rel, query, projected_schema, func_map, virtual_map);
 
-        outer_schema.clear();
+        project_input_schema.clear();
         ListCell *lc;
         int idx = 0;
         foreach(lc, query->targetList)
         {
             TargetEntry *tle = (TargetEntry *)lfirst(lc);
             Oid otype = exprType((Node *)tle->expr);
-            outer_schema.push_back({0, 0, otype});
+            project_input_schema.push_back({0, 0, otype});
             outer_virtuals[idx++] = tle->expr;
         }
     }
     else if (!schema.empty())
     {
-        auto [rt0, att0, typ0] = schema[0];
-        RangeTblEntry *rte =
-            (RangeTblEntry *)list_nth(query->rtable, rt0 - 1);
-        query->targetList = build_star_tlist(rte, rt0);
+        /* No aggregate — build tlist from full schema (all tables). */
+        List *tlist = NIL;
+        AttrNumber resno = 1;
+        for (auto &[rt, attnum, typeoid] : schema)
+        {
+            Oid collation = is_string_type(typeoid)
+                ? DEFAULT_COLLATION_OID : InvalidOid;
+            Var *var = makeVar(rt, attnum, typeoid, -1, collation, 0);
+            RangeTblEntry *rte =
+                (RangeTblEntry *)list_nth(query->rtable, rt - 1);
+            char *colname = (rte->rtekind == RTE_RELATION)
+                ? get_attname(rte->relid, attnum, false)
+                : pstrdup("?column?");
+            TargetEntry *tle = makeTargetEntry(
+                (Expr *)var, resno++, colname, false);
+            tlist = lappend(tlist, tle);
+        }
+        query->targetList = tlist;
     }
 
     /* --- Outer ProjectRel --- */
@@ -1482,7 +1563,7 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
         for (int i = 0; i < project_rel->expressions_size(); i++)
         {
             Expr *expr = convert_expression(
-                project_rel->expressions(i), outer_schema,
+                project_rel->expressions(i), project_input_schema,
                 func_map, outer_virtuals);
 
             const char *colname = "expr";
@@ -1623,6 +1704,10 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                 INT8OID, -1, InvalidOid, sizeof(int64),
                 Int64GetDatum(offset), false, true);
     }
+
+    /* Flag SubLinks so the planner runs SS_process_sublinks. */
+    if (contains_sublink(query->jointree->quals))
+        query->hasSubLinks = true;
 
     return query;
 }
