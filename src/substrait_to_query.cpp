@@ -1142,7 +1142,14 @@ substrait_to_query(const uint8_t *data, size_t len)
     const substrait::Rel *cur = &root_rel;
 
     /* Peel relations outermost-first.
-     * DuckDB plan shapes: [Sort?] > [Project?] > [Aggregate?] > [Project?] > [Filter?] > Read */
+     * [Fetch?] > [Sort?] > [Project?] > [Aggregate?] > [Project?] > [Filter?] > Read|Cross */
+    const substrait::FetchRel *fetch_rel = nullptr;
+    if (cur->has_fetch())
+    {
+        fetch_rel = &cur->fetch();
+        cur = &fetch_rel->input();
+    }
+
     const substrait::SortRel *sort_rel = nullptr;
     if (cur->has_sort())
     {
@@ -1348,6 +1355,19 @@ substrait_to_query(const uint8_t *data, size_t len)
             List *old_tlist = query->targetList;
             int old_len = list_length(old_tlist);
 
+            /* Build map: old ressortgroupref → expression, so we can
+             * reassign GROUP BY refs to matching new TLEs. */
+            std::unordered_map<Index, Expr *> sgref_expr;
+            {
+                ListCell *lc;
+                foreach(lc, old_tlist)
+                {
+                    TargetEntry *tle = (TargetEntry *)lfirst(lc);
+                    if (tle->ressortgroupref > 0)
+                        sgref_expr[tle->ressortgroupref] = tle->expr;
+                }
+            }
+
             List *new_tlist = NIL;
             AttrNumber resno = 1;
             for (int i = 0; i < emit.output_mapping_size(); i++)
@@ -1359,6 +1379,17 @@ substrait_to_query(const uint8_t *data, size_t len)
                         copyObjectImpl(list_nth(old_tlist, src));
                     tle->resno = resno++;
                     tle->resjunk = false;
+
+                    /* Match against old grouping key expressions. */
+                    for (auto &[ref, gexpr] : sgref_expr)
+                    {
+                        if (equal(tle->expr, gexpr))
+                        {
+                            tle->ressortgroupref = ref;
+                            break;
+                        }
+                    }
+
                     new_tlist = lappend(new_tlist, tle);
                 }
             }
@@ -1431,6 +1462,25 @@ substrait_to_query(const uint8_t *data, size_t len)
             sgc->hashable = hashable;
             query->sortClause = lappend(query->sortClause, sgc);
         }
+    }
+
+    /* FetchRel → LIMIT / OFFSET */
+    if (fetch_rel != nullptr)
+    {
+        int64_t count = -1, offset = 0;
+        if (fetch_rel->has_count())
+            count = fetch_rel->count();
+        if (fetch_rel->has_offset())
+            offset = fetch_rel->offset();
+
+        if (count >= 0)
+            query->limitCount = (Node *)makeConst(
+                INT8OID, -1, InvalidOid, sizeof(int64),
+                Int64GetDatum(count), false, true);
+        if (offset > 0)
+            query->limitOffset = (Node *)makeConst(
+                INT8OID, -1, InvalidOid, sizeof(int64),
+                Int64GetDatum(offset), false, true);
     }
 
     return query;

@@ -40,7 +40,7 @@ TPCH_DIR = os.path.join(SCRIPT_DIR, "tpch")
 # Features the converter currently handles.
 IMPLEMENTED = {"read", "aggregate", "project", "filter", "sort",
                "cast", "interval_day", "interval_year", "cross",
-               "like", "extract", "if_then"}
+               "like", "extract", "if_then", "fetch"}
 
 # TPC-H: features each query requires (from Isthmus plan analysis).
 TPCH_REQUIRES = {
@@ -139,7 +139,8 @@ def psql_run(sql):
 
 def psql_csv(sql):
     """Run query via psql, return rows as list of tuples."""
-    cmd = PSQL_CMD + ["-t", "-A", "-F,", "-c", sql]
+    sep = "\x01"  # avoid splitting on commas inside data
+    cmd = PSQL_CMD + ["-t", "-A", "-F", sep, "-c", sql]
     r = subprocess.run(cmd, capture_output=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(f"psql error:\n{r.stderr.decode()}")
@@ -150,7 +151,7 @@ def psql_csv(sql):
     for line in text.split("\n"):
         if not line:
             continue
-        rows.append(tuple(parse_csv_value(v) for v in line.split(",")))
+        rows.append(tuple(parse_csv_value(v) for v in line.split(sep)))
     return rows
 
 
@@ -205,6 +206,9 @@ def normalize_value(v):
         return round(v, 4)
     if isinstance(v, str):
         return v.strip()
+    # Arrow returns datetime.date for DATE columns
+    if hasattr(v, 'isoformat'):
+        return v.isoformat()
     return v
 
 
