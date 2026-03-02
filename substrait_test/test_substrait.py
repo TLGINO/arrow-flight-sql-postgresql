@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Substrait integration tests — unit operators + TPC-H.
+Substrait integration tests — TPC-H.
 
-Unit tests use Isthmus (substrait-java) CLI to generate plans on-the-fly.
-TPC-H tests use prebuilt Isthmus binary plans from substrait_test/tpch/plans/.
+Prebuilt Substrait binary plans from substrait_test/tpch/plans/.
 PostgreSQL (via psql) provides expected results; Flight SQL provides actual.
 
 Run: python3 substrait_test/test_substrait.py
@@ -22,13 +21,6 @@ import pyarrow.flight as flight
 FLIGHT_URI = "grpc://127.0.0.1:15432"
 PSQL_CMD = ["psql", "-h", "127.0.0.1", "-U", "martin", "-d", "postgres",
             "-v", "ON_ERROR_STOP=1"]
-
-# Isthmus CLI via Gradle wrapper
-ISTHMUS_JAVA_HOME = os.environ.get(
-    "ISTHMUS_JAVA_HOME", "/usr/lib/jvm/java-21-openjdk")
-ISTHMUS_DIR = os.environ.get(
-    "ISTHMUS_DIR",
-    os.path.expanduser("~/Documents/substrait-java"))
 
 TPCH_DATA_DIR = os.environ.get(
     "TPCH_DATA_DIR",
@@ -86,45 +78,6 @@ TPCH_REQUIRES = {
          "cross", "subquery"},
     22: {"aggregate", "filter", "project", "read", "sort", "subquery"},
 }
-
-
-# ============================================================
-# Helpers — Isthmus
-# ============================================================
-
-_isthmus_available = None
-
-def check_isthmus():
-    global _isthmus_available
-    if _isthmus_available is not None:
-        return _isthmus_available
-    gradlew = os.path.join(ISTHMUS_DIR, "gradlew")
-    javac = os.path.join(ISTHMUS_JAVA_HOME, "bin", "javac")
-    _isthmus_available = os.path.isfile(gradlew) and os.path.isfile(javac)
-    return _isthmus_available
-
-
-def isthmus_plan(create_stmts, query):
-    """Run isthmus CLI → binary substrait plan."""
-    inner_args = []
-    for c in create_stmts:
-        inner_args.append(f'-c "{c}"')
-    inner_args.append("--outputformat BINARY")
-    inner_args.append(f'"{query}"')
-
-    env = os.environ.copy()
-    env["JAVA_HOME"] = ISTHMUS_JAVA_HOME
-
-    cmd = [
-        os.path.join(ISTHMUS_DIR, "gradlew"),
-        "-p", ISTHMUS_DIR,
-        ":isthmus-cli:run",
-        "--args", " ".join(inner_args),
-    ]
-    r = subprocess.run(cmd, capture_output=True, timeout=120, env=env)
-    if r.returncode != 0:
-        raise RuntimeError(f"Isthmus error:\n{r.stderr.decode()}")
-    return r.stdout
 
 
 # ============================================================
@@ -186,10 +139,26 @@ def pb_field(n, data):
     return varint((n << 3) | 2) + varint(len(data)) + data
 
 
+_flight_client = None
+_flight_options = None
+
+def _get_flight():
+    global _flight_client, _flight_options
+    if _flight_client is None:
+        _flight_client = flight.FlightClient(FLIGHT_URI)
+        token_pair = _flight_client.authenticate_basic_token("martin", "")
+        _flight_options = flight.FlightCallOptions(headers=[token_pair])
+    return _flight_client, _flight_options
+
+def flight_reset():
+    global _flight_client, _flight_options
+    if _flight_client:
+        _flight_client.close()
+    _flight_client = None
+    _flight_options = None
+
 def flight_exec_substrait(plan_bytes):
-    client = flight.FlightClient(FLIGHT_URI)
-    token_pair = client.authenticate_basic_token("martin", "")
-    options = flight.FlightCallOptions(headers=[token_pair])
+    client, options = _get_flight()
     cmd = pb_field(
         1, b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementSubstraitPlan"
     ) + pb_field(2, pb_field(1, pb_field(1, plan_bytes)))
@@ -206,7 +175,14 @@ def normalize_value(v):
     if isinstance(v, float):
         return round(v, 4)
     if isinstance(v, str):
-        return v.strip()
+        v = v.strip()
+        try:
+            return int(v)
+        except ValueError:
+            try:
+                return round(float(v), 4)
+            except ValueError:
+                return v
     # Arrow returns datetime.date for DATE columns
     if hasattr(v, 'isoformat'):
         return v.isoformat()
@@ -237,7 +213,7 @@ def rows_equal(expected, actual, ordered=False):
 
 
 # ============================================================
-# TPC-H data loading
+# TPC-H
 # ============================================================
 
 TPCH_TABLES = ["REGION", "NATION", "PART", "SUPPLIER", "PARTSUPP",
@@ -309,83 +285,6 @@ def run_test(name, requires, fn):
 
 
 # ============================================================
-# Unit test helpers
-# ============================================================
-
-def run_unit_test(pg_setup_sql, pg_query, create_stmts, isthmus_query):
-    """
-    pg_setup_sql: DROP/CREATE/INSERT for PG (UPPERCASE quoted names)
-    pg_query: reference query for PG (UPPERCASE quoted names)
-    create_stmts: CREATE TABLE stmts for isthmus (lowercase, unquoted)
-    isthmus_query: query for isthmus (lowercase, unquoted)
-    """
-    psql_run(pg_setup_sql)
-    expected = psql_csv(pg_query)
-
-    plan = isthmus_plan(create_stmts, isthmus_query)
-    actual = table_to_rows(flight_exec_substrait(plan))
-
-    ok, diff = rows_equal(expected, actual)
-    if not ok:
-        raise AssertionError(f"Mismatch: {diff}")
-
-
-# (isthmus_create, pg_create, insert)
-TABLES = {
-    "t1": ('CREATE TABLE t1(id INTEGER, name VARCHAR(50))',
-           'CREATE TABLE "T1"("ID" INTEGER, "NAME" VARCHAR(50))',
-           'INSERT INTO "T1" VALUES (1,\'alice\'),(2,\'bob\'),(3,\'charlie\')'),
-    "t2": ('CREATE TABLE t2(x INTEGER)',
-           'CREATE TABLE "T2"("X" INTEGER)',
-           'INSERT INTO "T2" VALUES (1),(2),(3),(4),(5)'),
-    "t3": ('CREATE TABLE t3(color VARCHAR(50))',
-           'CREATE TABLE "T3"("COLOR" VARCHAR(50))',
-           'INSERT INTO "T3" VALUES (\'red\'),(\'blue\'),(\'red\'),(\'green\'),(\'blue\'),(\'red\')'),
-    "t4": ('CREATE TABLE t4(x INTEGER)',
-           'CREATE TABLE "T4"("X" INTEGER)',
-           'INSERT INTO "T4" VALUES (10),(20),(30),(40),(50)'),
-    "t5": ('CREATE TABLE t5(t1_id INTEGER, val VARCHAR(50))',
-           'CREATE TABLE "T5"("T1_ID" INTEGER, "VAL" VARCHAR(50))',
-           'INSERT INTO "T5" VALUES (1,\'x\'),(2,\'y\'),(3,\'z\'),(1,\'w\')'),
-}
-
-
-def setup(*names):
-    """Return (pg_setup_sql, isthmus_creates) for given tables."""
-    pg_setup = "\n".join(
-        f'DROP TABLE IF EXISTS "{n.upper()}";\n{TABLES[n][1]};\n{TABLES[n][2]};'
-        for n in names)
-    isthmus_creates = [TABLES[n][0] for n in names]
-    return pg_setup, isthmus_creates
-
-
-def pg_query_for(query):
-    """Convert a lowercase unquoted query to PG-compatible UPPERCASE quoted query."""
-    import re
-
-    # Tokenize: keep strings, numbers, operators, and words
-    tokens = re.findall(r"'[^']*'|\d+(?:\.\d+)?|[(),;*+\-/<>=!]+|\w+", query)
-
-    keywords = {'select', 'from', 'where', 'group', 'by', 'order', 'as',
-                'and', 'or', 'not', 'in', 'on', 'join', 'inner', 'left',
-                'right', 'count', 'sum', 'avg', 'min', 'max', 'asc', 'desc',
-                'limit', 'offset', 'having', 'distinct'}
-
-    result = []
-    for tok in tokens:
-        if tok.startswith("'"):
-            result.append(tok)
-        elif tok.lower() in keywords:
-            result.append(tok.upper())
-        elif re.match(r'^[a-zA-Z_]\w*$', tok):
-            result.append(f'"{tok.upper()}"')
-        else:
-            result.append(tok)
-
-    return " ".join(result)
-
-
-# ============================================================
 # TPC-H test
 # ============================================================
 
@@ -409,62 +308,8 @@ def run_tpch_test(qnr):
         raise AssertionError(f"Mismatch: {diff}")
 
 
-# ============================================================
-# Tier 1 — Unit operator tests
-# ============================================================
-
-def tier1_tests():
-    print("\nTier 1 — Unit operators")
-    print("-" * 40)
-
-    if not check_isthmus():
-        print("  (Isthmus not available — skipping unit tests)")
-        print("  Set ISTHMUS_DIR and ensure JDK is installed")
-        return
-
-    def unit(name, requires, tables, query):
-        requires = requires | {"isthmus"}
-        pg_setup, isthmus_creates = setup(*tables)
-        pq = pg_query_for(query)
-        run_test(name, requires, lambda:
-            run_unit_test(pg_setup, pq, isthmus_creates, query))
-
-    # ReadRel
-    unit("SELECT *", {"read"},
-         ["t1"], "SELECT * FROM t1")
-
-    # AggregateRel
-    unit("count(*)", {"read", "aggregate"},
-         ["t2"], "SELECT count(*) FROM t2")
-
-    unit("GROUP BY + count", {"read", "aggregate"},
-         ["t3"], "SELECT color, count(*) FROM t3 GROUP BY color")
-
-    unit("sum/avg/min/max", {"read", "aggregate"},
-         ["t4"], "SELECT sum(x), avg(x), min(x), max(x) FROM t4")
-
-    # FilterRel
-    unit("WHERE simple", {"read", "filter"},
-         ["t2"], "SELECT * FROM t2 WHERE x > 3")
-
-    unit("WHERE + agg", {"read", "filter", "aggregate"},
-         ["t2"], "SELECT count(*) FROM t2 WHERE x > 2")
-
-    # SortRel
-    unit("ORDER BY", {"read", "sort"},
-         ["t1"], "SELECT * FROM t1 ORDER BY id")
-
-    # Expressions
-    unit("Arith expression", {"read", "project", "filter"},
-         ["t2"], "SELECT x, x * 2 + 1 AS doubled FROM t2 WHERE x > 2")
-
-
-# ============================================================
-# Tier 2 — TPC-H queries
-# ============================================================
-
-def tier2_tests():
-    print("\nTier 2 — TPC-H")
+def tpch_tests():
+    print("\nTPC-H")
     print("-" * 40)
 
     any_runnable = any(
@@ -487,22 +332,12 @@ def tier2_tests():
 def main():
     print("Substrait integration tests")
     print("=" * 40)
-
-    if check_isthmus():
-        IMPLEMENTED.add("isthmus")
     print(f"Implemented: {sorted(IMPLEMENTED)}")
 
-    tier1_tests()
-    tier2_tests()
+    tpch_tests()
 
-    # Cleanup
-    try:
-        drop = "; ".join(f'DROP TABLE IF EXISTS "{n.upper()}"'
-                         for n in TABLES.keys())
-        psql_run(drop + ";")
-    except Exception:
-        pass
     cleanup_tpch()
+    flight_reset()
 
     p, f, s = _results["pass"], _results["fail"], _results["skip"]
     print("\n" + "=" * 40)

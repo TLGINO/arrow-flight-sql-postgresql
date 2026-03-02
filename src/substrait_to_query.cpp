@@ -399,9 +399,39 @@ build_from_node(const substrait::Rel &rel, Query *query,
         return (Node *)jexpr;
     }
 
-    ereport(ERROR,
-            (errmsg("substrait: unsupported base relation type")));
-    return NULL;
+    /* Non-base rel (e.g. Aggregate inside a Cross) — wrap as subquery. */
+    Query *subq = build_query_for_rel(&rel, func_map, nullptr, nullptr);
+
+    RangeTblEntry *sub_rte = makeNode(RangeTblEntry);
+    sub_rte->rtekind = RTE_SUBQUERY;
+    sub_rte->subquery = subq;
+    sub_rte->lateral = false;
+    sub_rte->inh = false;
+    sub_rte->inFromCl = true;
+
+    List *colnames = NIL;
+    int attno = 1;
+    ListCell *lc;
+    foreach(lc, subq->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *)lfirst(lc);
+        colnames = lappend(colnames,
+            makeString(pstrdup(tle->resname ? tle->resname : "?column?")));
+        Oid t = exprType((Node *)tle->expr);
+        schema_out.push_back({0, (AttrNumber)attno, t});
+        attno++;
+    }
+    sub_rte->eref = makeAlias(pstrdup("subq"), colnames);
+
+    query->rtable = lappend(query->rtable, sub_rte);
+    int sub_rtindex = list_length(query->rtable);
+
+    for (auto &[rt, attnum, typeoid] : schema_out)
+        if (rt == 0) rt = sub_rtindex;
+
+    RangeTblRef *rtr = makeNode(RangeTblRef);
+    rtr->rtindex = sub_rtindex;
+    return (Node *)rtr;
 }
 
 /* Top-level: process base relation tree into query->jointree->fromlist. */
@@ -736,6 +766,88 @@ convert_expression(const substrait::Expression &expr,
             sl->subLinkId = 0;
             sl->testexpr = NULL;
             sl->operName = NIL;
+            sl->subselect = (Node *)subq;
+            sl->location = -1;
+            return (Expr *)sl;
+        }
+
+        /* EXISTS (subquery) */
+        if (sq.has_set_predicate())
+        {
+            const auto &sp = sq.set_predicate();
+            Query *subq = build_query_for_rel(
+                &sp.tuples(), func_map, nullptr, &schema);
+
+            SubLink *sl = makeNode(SubLink);
+            sl->subLinkType = EXISTS_SUBLINK;
+            sl->subLinkId = 0;
+            sl->testexpr = NULL;
+            sl->operName = NIL;
+            sl->subselect = (Node *)subq;
+            sl->location = -1;
+            return (Expr *)sl;
+        }
+
+        /* x IN (subquery) → ANY_SUBLINK */
+        if (sq.has_in_predicate())
+        {
+            const auto &inp = sq.in_predicate();
+            Query *subq = build_query_for_rel(
+                &inp.haystack(), func_map, nullptr, &schema);
+
+            /* Build testexpr: needle = Param(PARAM_SUBLINK) */
+            Expr *needle = convert_expression(
+                inp.needles(0), schema, func_map, virtuals, outer_schema);
+            Oid needle_type = exprType((Node *)needle);
+
+            TargetEntry *ste = (TargetEntry *)linitial(subq->targetList);
+            Oid subq_type = exprType((Node *)ste->expr);
+
+            Param *param = makeNode(Param);
+            param->paramkind = PARAM_SUBLINK;
+            param->paramid = 1;
+            param->paramtype = subq_type;
+            param->paramtypmod = -1;
+            param->paramcollid = is_string_type(subq_type)
+                ? DEFAULT_COLLATION_OID : InvalidOid;
+            param->location = -1;
+
+            /* Coerce types if needed for operator lookup. */
+            Oid ltype = needle_type, rtype = subq_type;
+            if (is_string_type(ltype) && is_string_type(rtype) &&
+                ltype != rtype)
+            {
+                needle = coerce_to_text(needle);
+                ltype = TEXTOID;
+                param->paramtype = TEXTOID;
+                param->paramcollid = DEFAULT_COLLATION_OID;
+                rtype = TEXTOID;
+            }
+
+            List *opname = list_make1(makeString(pstrdup("=")));
+            Oid opoid = LookupOperName(NULL, opname, ltype, rtype,
+                                       false, -1);
+            HeapTuple optup = SearchSysCache1(OPEROID,
+                                              ObjectIdGetDatum(opoid));
+            Form_pg_operator opform = (Form_pg_operator)GETSTRUCT(optup);
+
+            OpExpr *op = makeNode(OpExpr);
+            op->opno = opoid;
+            op->opfuncid = opform->oprcode;
+            op->opresulttype = BOOLOID;
+            op->opretset = false;
+            op->opcollid = InvalidOid;
+            op->inputcollid = (is_string_type(ltype) || is_string_type(rtype))
+                ? DEFAULT_COLLATION_OID : InvalidOid;
+            op->args = list_make2(needle, param);
+            op->location = -1;
+            ReleaseSysCache(optup);
+
+            SubLink *sl = makeNode(SubLink);
+            sl->subLinkType = ANY_SUBLINK;
+            sl->subLinkId = 0;
+            sl->testexpr = (Node *)op;
+            sl->operName = list_make1(makeString(pstrdup("=")));
             sl->subselect = (Node *)subq;
             sl->location = -1;
             return (Expr *)sl;
@@ -1189,6 +1301,47 @@ convert_expression(const substrait::Expression &expr,
             fe->funccollid = InvalidOid;
             fe->inputcollid = InvalidOid;
             fe->args = list_make2(field_text, date_arg);
+            fe->location = -1;
+            return (Expr *)fe;
+        }
+
+        /* substring(string, start, length) → PG substring(text,int,int) */
+        if (fname == "substring")
+        {
+            if (sf.arguments_size() < 2)
+                ereport(ERROR,
+                        (errmsg("substrait: substring expects 2-3 args")));
+            Expr *str_arg = coerce_to_text(convert_expression(
+                sf.arguments(0).value(), schema, func_map,
+                virtuals, outer_schema));
+            Expr *start_arg = convert_expression(
+                sf.arguments(1).value(), schema, func_map,
+                virtuals, outer_schema);
+
+            List *args = list_make2(str_arg, start_arg);
+            int nargs = 2;
+            Oid argtypes[3] = {TEXTOID, INT4OID, INT4OID};
+            if (sf.arguments_size() >= 3)
+            {
+                Expr *len_arg = convert_expression(
+                    sf.arguments(2).value(), schema, func_map,
+                    virtuals, outer_schema);
+                args = lappend(args, len_arg);
+                nargs = 3;
+            }
+
+            List *funcname = list_make1(makeString(pstrdup("substring")));
+            Oid funcoid = LookupFuncName(funcname, nargs, argtypes, false);
+
+            FuncExpr *fe = makeNode(FuncExpr);
+            fe->funcid = funcoid;
+            fe->funcresulttype = TEXTOID;
+            fe->funcretset = false;
+            fe->funcvariadic = false;
+            fe->funcformat = COERCE_EXPLICIT_CALL;
+            fe->funccollid = DEFAULT_COLLATION_OID;
+            fe->inputcollid = DEFAULT_COLLATION_OID;
+            fe->args = args;
             fe->location = -1;
             return (Expr *)fe;
         }
@@ -1706,7 +1859,8 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
     }
 
     /* Flag SubLinks so the planner runs SS_process_sublinks. */
-    if (contains_sublink(query->jointree->quals))
+    if (contains_sublink(query->jointree->quals) ||
+        contains_sublink((Node *)query->targetList))
         query->hasSubLinks = true;
 
     return query;
