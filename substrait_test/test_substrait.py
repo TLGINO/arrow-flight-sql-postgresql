@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Substrait integration tests — TPC-H.
+Substrait integration tests — TPC-H & TPC-DS.
 
-Prebuilt Substrait binary plans from substrait_test/tpch/plans/.
+Prebuilt Substrait binary plans from substrait_test/{tpch,tpcds}/plans/.
 PostgreSQL (via psql) provides expected results; Flight SQL provides actual.
 
 Run: python3 substrait_test/test_substrait.py
@@ -11,6 +11,7 @@ Run: python3 substrait_test/test_substrait.py
 import os
 import subprocess
 import sys
+import tempfile
 
 import pyarrow.flight as flight
 
@@ -22,12 +23,27 @@ FLIGHT_URI = "grpc://127.0.0.1:15432"
 PSQL_CMD = ["psql", "-h", "127.0.0.1", "-U", "martin", "-d", "postgres",
             "-v", "ON_ERROR_STOP=1"]
 
+# CLI: --sf 0.1, --suite tpch/tpcds, --query 16
+SCALE_FACTOR = os.environ.get("SCALE_FACTOR", "1")
+FILTER_SUITE = None   # None = all
+FILTER_QUERY = None   # None = all
+for i, a in enumerate(sys.argv[1:], 1):
+    if a == "--sf" and i < len(sys.argv) - 1:
+        SCALE_FACTOR = sys.argv[i + 1]
+    elif a == "--suite" and i < len(sys.argv) - 1:
+        FILTER_SUITE = sys.argv[i + 1]
+    elif a == "--query" and i < len(sys.argv) - 1:
+        FILTER_QUERY = int(sys.argv[i + 1])
+
 TPCH_DATA_DIR = os.environ.get(
-    "TPCH_DATA_DIR",
-    os.path.expanduser("~/Downloads/tpch/tpch/data"))
+    "TPCH_DATA_DIR", f"/tmp/tpch_sf{SCALE_FACTOR}")
+
+TPCDS_DATA_DIR = os.environ.get(
+    "TPCDS_DATA_DIR", f"/tmp/tpcds_sf{SCALE_FACTOR}")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TPCH_DIR = os.path.join(SCRIPT_DIR, "tpch")
+TPCDS_DIR = os.path.join(SCRIPT_DIR, "tpcds")
 
 # Features the converter currently handles.
 IMPLEMENTED = {"read", "aggregate", "project", "filter", "sort",
@@ -227,7 +243,7 @@ def load_tpch_into_pg():
     if _tpch_loaded:
         return
 
-    print("  Loading TPC-H sf=0.01 into PostgreSQL ... ", end="", flush=True)
+    print(f"  Loading TPC-H SF{SCALE_FACTOR} into PostgreSQL ... ", end="", flush=True)
 
     init_sql = os.path.join(TPCH_DIR, "pg_init.sql")
     cmd = PSQL_CMD + ["-f", init_sql]
@@ -244,9 +260,20 @@ def load_tpch_into_pg():
         tbl_file = os.path.join(TPCH_DATA_DIR, f"{tbl_name_map[table]}.tbl")
         if not os.path.exists(tbl_file):
             raise RuntimeError(f"Missing data file: {tbl_file}")
-        copy_sql = (f"\\COPY \"{table}\" FROM '{tbl_file}' "
+        # Strip trailing '|' (dbgen artifact)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.tbl',
+                                         delete=False) as tmp:
+            with open(tbl_file) as src:
+                for line in src:
+                    stripped = line.rstrip()
+                    if stripped.endswith('|'):
+                        stripped = stripped[:-1]
+                    tmp.write(stripped + '\n')
+            tmp_path = tmp.name
+        copy_sql = (f"\\COPY \"{table}\" FROM '{tmp_path}' "
                     f"WITH (FORMAT csv, DELIMITER '|');")
         psql_run(copy_sql)
+        os.unlink(tmp_path)
 
     _tpch_loaded = True
     print("done")
@@ -267,6 +294,20 @@ def cleanup_tpch():
 _results = {"pass": 0, "fail": 0, "skip": 0}
 
 
+def _wait_for_pg(max_wait=30):
+    """Block until PG accepts connections (after crash recovery)."""
+    import time
+    for _ in range(max_wait):
+        try:
+            subprocess.run(PSQL_CMD + ["-c", "SELECT 1"],
+                           capture_output=True, timeout=5)
+            return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
 def run_test(name, requires, fn):
     missing = set(requires) - IMPLEMENTED
     if missing:
@@ -280,8 +321,12 @@ def run_test(name, requires, fn):
         print("PASS")
         _results["pass"] += 1
     except Exception as e:
-        print(f"FAIL\n    {e}")
+        msg = str(e).split('\n')[0][:120]
+        print(f"FAIL\n    {msg}")
         _results["fail"] += 1
+        # Reset Flight client in case PG crashed / connection broke
+        flight_reset()
+        _wait_for_pg()
 
 
 # ============================================================
@@ -320,9 +365,112 @@ def tpch_tests():
         load_tpch_into_pg()
 
     for qnr in range(1, 23):
+        if FILTER_QUERY is not None and qnr != FILTER_QUERY:
+            continue
         required = TPCH_REQUIRES.get(qnr, set())
         run_test(f"TPC-H Q{qnr:02d}", required, lambda q=qnr:
             run_tpch_test(q))
+
+
+# ============================================================
+# TPC-DS
+# ============================================================
+
+# dsdgen file name -> UPPERCASE PG table name
+TPCDS_TABLES = [
+    "CALL_CENTER", "CATALOG_PAGE", "CATALOG_RETURNS", "CATALOG_SALES",
+    "CUSTOMER", "CUSTOMER_ADDRESS", "CUSTOMER_DEMOGRAPHICS", "DATE_DIM",
+    "DBGEN_VERSION", "HOUSEHOLD_DEMOGRAPHICS", "INCOME_BAND", "INVENTORY",
+    "ITEM", "PROMOTION", "REASON", "SHIP_MODE", "STORE", "STORE_RETURNS",
+    "STORE_SALES", "TIME_DIM", "WAREHOUSE", "WEB_PAGE", "WEB_RETURNS",
+    "WEB_SALES", "WEB_SITE",
+]
+
+_tpcds_loaded = False
+
+
+def load_tpcds_into_pg():
+    global _tpcds_loaded
+    if _tpcds_loaded:
+        return
+
+    print(f"  Loading TPC-DS SF{SCALE_FACTOR} into PostgreSQL ... ", end="", flush=True)
+
+    init_sql = os.path.join(TPCDS_DIR, "pg_init.sql")
+    cmd = PSQL_CMD + ["-f", init_sql]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"pg_init.sql failed:\n{r.stderr.decode()}")
+
+    for table in TPCDS_TABLES:
+        dat_file = os.path.join(TPCDS_DATA_DIR, f"{table.lower()}.dat")
+        if not os.path.exists(dat_file):
+            raise RuntimeError(f"Missing data file: {dat_file}")
+        # dsdgen produces trailing '|' — strip it for COPY
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.dat',
+                                         delete=False) as tmp:
+            with open(dat_file) as src:
+                for line in src:
+                    stripped = line.rstrip()
+                    if stripped.endswith('|'):
+                        stripped = stripped[:-1]
+                    tmp.write(stripped + '\n')
+            tmp_path = tmp.name
+        copy_sql = (f"\\COPY \"tpcds\".\"{table}\" FROM '{tmp_path}' "
+                    f"WITH (FORMAT csv, DELIMITER '|', NULL '');")
+        psql_run(copy_sql)
+        os.unlink(tmp_path)
+
+    _tpcds_loaded = True
+    print("done")
+
+
+def cleanup_tpcds():
+    if not _tpcds_loaded:
+        return
+    psql_run('DROP SCHEMA IF EXISTS "tpcds" CASCADE;\n')
+
+
+def run_tpcds_test(qnr):
+    plan_file = os.path.join(TPCDS_DIR, "plans", f"{qnr:02d}.proto")
+    with open(plan_file, "rb") as f:
+        plan = f.read()
+
+    query_file = os.path.join(TPCDS_DIR, "queries", f"{qnr:02d}.sql")
+    with open(query_file) as f:
+        query_sql = f.read().strip()
+    if query_sql.endswith(";"):
+        query_sql = query_sql[:-1]
+
+    expected = psql_csv(query_sql)
+    actual = table_to_rows(flight_exec_substrait(plan))
+
+    has_sort = "order by" in query_sql.lower()
+    ok, diff = rows_equal(expected, actual, ordered=has_sort)
+    if not ok:
+        raise AssertionError(f"Mismatch: {diff}")
+
+
+def tpcds_tests():
+    print("\nTPC-DS")
+    print("-" * 40)
+
+    # Discover available plans
+    plans_dir = os.path.join(TPCDS_DIR, "plans")
+    available = sorted(
+        int(f[:2]) for f in os.listdir(plans_dir) if f.endswith(".proto")
+    )
+    if not available:
+        print("  No TPC-DS plans found, skipping.")
+        return
+
+    load_tpcds_into_pg()
+
+    for qnr in available:
+        if FILTER_QUERY is not None and qnr != FILTER_QUERY:
+            continue
+        run_test(f"TPC-DS Q{qnr:02d}", set(), lambda q=qnr:
+            run_tpcds_test(q))
 
 
 # ============================================================
@@ -330,13 +478,19 @@ def tpch_tests():
 # ============================================================
 
 def main():
-    print("Substrait integration tests")
+    print(f"Substrait integration tests (SF{SCALE_FACTOR})")
     print("=" * 40)
     print(f"Implemented: {sorted(IMPLEMENTED)}")
 
-    tpch_tests()
+    if FILTER_SUITE in (None, "tpch"):
+        tpch_tests()
+    if FILTER_SUITE in (None, "tpcds"):
+        tpcds_tests()
 
-    cleanup_tpch()
+    if FILTER_SUITE in (None, "tpch"):
+        cleanup_tpch()
+    if FILTER_SUITE in (None, "tpcds"):
+        cleanup_tpcds()
     flight_reset()
 
     p, f, s = _results["pass"], _results["fail"], _results["skip"]

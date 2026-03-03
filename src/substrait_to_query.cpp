@@ -2,7 +2,7 @@
  * substrait_to_query.cpp
  *
  * Converts a serialized Substrait Plan into a PostgreSQL Query* tree.
- * Supported: [SortRel?] > [ProjectRel?] > [AggregateRel?] > [ProjectRel?] > [FilterRel?] > ReadRel|CrossRel
+ * Supported: [SortRel?] > [ProjectRel?] > [AggregateRel?] > [ProjectRel?] > [FilterRel?] > ReadRel|CrossRel|SetRel
  * CrossRel trees (nested cross products) produce multi-table FROM clauses.
  * ReadRel.filter and ReadRel.projection are also handled.
  *
@@ -280,7 +280,8 @@ convert_expression(const substrait::Expression &expr,
                    const SubstraitSchema &schema,
                    const FuncMap &func_map,
                    const VirtualMap &virtuals = {},
-                   const SubstraitSchema *outer_schema = nullptr);
+                   const SubstraitSchema *outer_schema = nullptr,
+                   Query *window_query = nullptr);
 
 static Query *
 build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
@@ -642,8 +643,14 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
         Oid rettype = ((Form_pg_proc)GETSTRUCT(proctup))->prorettype;
         ReleaseSysCache(proctup);
 
+        bool is_distinct =
+            (!is_star &&
+             amf.invocation() ==
+             substrait::AggregateFunction::AGGREGATION_INVOCATION_DISTINCT);
+
         List *agg_args = NIL;
         List *aggargtypes = NIL;
+        List *distinctList = NIL;
         if (!is_star)
         {
             for (size_t i = 0; i < converted_args.size(); i++)
@@ -652,10 +659,30 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
                     makeTargetEntry(converted_args[i],
                                     (AttrNumber)(i + 1),
                                     NULL, false);
+                if (is_distinct)
+                    arg_tle->ressortgroupref = (Index)(i + 1);
                 agg_args = lappend(agg_args, arg_tle);
             }
             for (Oid oid : argtypes)
                 aggargtypes = lappend_oid(aggargtypes, oid);
+
+            if (is_distinct)
+            {
+                for (size_t i = 0; i < argtypes.size(); i++)
+                {
+                    Oid eqop, sortop;
+                    bool hashable;
+                    get_sort_group_operators(argtypes[i], false, true, false,
+                                             &sortop, &eqop, NULL, &hashable);
+                    SortGroupClause *sgc = makeNode(SortGroupClause);
+                    sgc->tleSortGroupRef = (Index)(i + 1);
+                    sgc->eqop = eqop;
+                    sgc->sortop = sortop;
+                    sgc->nulls_first = false;
+                    sgc->hashable = hashable;
+                    distinctList = lappend(distinctList, sgc);
+                }
+            }
         }
 
         Aggref *aggref = makeNode(Aggref);
@@ -668,7 +695,7 @@ aggregate_rel_to_targetlist(const substrait::AggregateRel &agg,
         aggref->aggdirectargs = NIL;
         aggref->args = agg_args;
         aggref->aggorder = NIL;
-        aggref->aggdistinct = NIL;
+        aggref->aggdistinct = distinctList;
         aggref->aggfilter = NULL;
         aggref->aggstar = is_star;
         aggref->aggvariadic = false;
@@ -708,7 +735,8 @@ convert_expression(const substrait::Expression &expr,
                    const SubstraitSchema &schema,
                    const FuncMap &func_map,
                    const VirtualMap &virtuals,
-                   const SubstraitSchema *outer_schema)
+                   const SubstraitSchema *outer_schema,
+                   Query *window_query)
 {
     /* --- FieldReference → Var (or virtual expression) --- */
     if (expr.has_selection())
@@ -861,6 +889,12 @@ convert_expression(const substrait::Expression &expr,
     if (expr.has_literal())
     {
         const auto &lit = expr.literal();
+
+        /* NULL literal — type info is in lit.null(), but PG just needs
+         * a Const with isnull=true.  Use UNKNOWNOID; the planner casts. */
+        if (lit.has_null())
+            return (Expr *)makeConst(UNKNOWNOID, -1, InvalidOid, -1,
+                                     (Datum)0, true, false);
 
         if (lit.has_boolean())
             return (Expr *)makeConst(BOOLOID, -1, InvalidOid, 1,
@@ -1025,16 +1059,19 @@ convert_expression(const substrait::Expression &expr,
             const auto &clause = ift.ifs(i);
             CaseWhen *w = makeNode(CaseWhen);
             w->expr = convert_expression(clause.if_(), schema,
-                                         func_map, virtuals, outer_schema);
+                                         func_map, virtuals, outer_schema,
+                                         window_query);
             w->result = convert_expression(clause.then(), schema,
-                                           func_map, virtuals, outer_schema);
+                                           func_map, virtuals, outer_schema,
+                                           window_query);
             w->location = -1;
             c->args = lappend(c->args, w);
         }
 
         if (ift.has_else_())
             c->defresult = convert_expression(ift.else_(), schema,
-                                              func_map, virtuals, outer_schema);
+                                              func_map, virtuals, outer_schema,
+                                              window_query);
 
         /* Result type from first THEN branch. */
         Oid rtype = exprType((Node *)((CaseWhen *)linitial(c->args))->result);
@@ -1053,7 +1090,8 @@ convert_expression(const substrait::Expression &expr,
             ereport(ERROR, (errmsg("substrait: cast without input")));
 
         Expr *input = convert_expression(cast.input(), schema,
-                                         func_map, virtuals, outer_schema);
+                                         func_map, virtuals, outer_schema,
+                                         window_query);
         Oid src_type = exprType((Node *)input);
 
         /* Map substrait target type to PG OID. */
@@ -1346,6 +1384,75 @@ convert_expression(const substrait::Expression &expr,
             return (Expr *)fe;
         }
 
+        /* Generic PG function call by name (round, abs, coalesce, …). */
+        static const std::unordered_map<std::string, const char *> kFuncNameMap = {
+            {"round", "round"}, {"abs", "abs"}, {"coalesce", "coalesce"},
+            {"upper", "upper"}, {"lower", "lower"}, {"char_length", "char_length"},
+            {"concat", "concat"}, {"ltrim", "ltrim"}, {"rtrim", "rtrim"},
+            {"trim", "btrim"}, {"replace", "replace"}, {"modulus", "mod"},
+            {"negate", NULL},  /* handled as unary minus */
+            {"power", "power"}, {"sqrt", "sqrt"}, {"ceil", "ceil"},
+            {"floor", "floor"},
+        };
+        auto fnit = kFuncNameMap.find(fname);
+        if (fnit != kFuncNameMap.end() && fnit->second != NULL)
+        {
+            List *args = NIL;
+            std::vector<Oid> argtypes_v;
+            for (int i = 0; i < sf.arguments_size(); i++)
+            {
+                Expr *a = convert_expression(sf.arguments(i).value(),
+                                             schema, func_map,
+                                             virtuals, outer_schema,
+                                             window_query);
+                args = lappend(args, a);
+                argtypes_v.push_back(exprType((Node *)a));
+            }
+            List *funcname = list_make1(makeString(pstrdup(fnit->second)));
+            Oid funcoid = LookupFuncName(funcname,
+                                         (int)argtypes_v.size(),
+                                         argtypes_v.data(), false);
+            HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+            Oid rettype = ((Form_pg_proc)GETSTRUCT(proctup))->prorettype;
+            ReleaseSysCache(proctup);
+
+            FuncExpr *fe = makeNode(FuncExpr);
+            fe->funcid = funcoid;
+            fe->funcresulttype = rettype;
+            fe->funcretset = false;
+            fe->funcvariadic = false;
+            fe->funcformat = COERCE_EXPLICIT_CALL;
+            fe->funccollid = InvalidOid;
+            fe->inputcollid = InvalidOid;
+            fe->args = args;
+            fe->location = -1;
+            return (Expr *)fe;
+        }
+
+        /* negate → unary minus */
+        if (fname == "negate")
+        {
+            Expr *arg = convert_expression(sf.arguments(0).value(), schema, func_map,
+                                           virtuals, outer_schema);
+            Oid argtype = exprType((Node *)arg);
+            List *opname = list_make1(makeString(pstrdup("-")));
+            Oid opoid = LookupOperName(NULL, opname, InvalidOid, argtype,
+                                       false, -1);
+            HeapTuple optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(opoid));
+            Form_pg_operator opform = (Form_pg_operator)GETSTRUCT(optup);
+            OpExpr *op = makeNode(OpExpr);
+            op->opno = opoid;
+            op->opfuncid = opform->oprcode;
+            op->opresulttype = opform->oprresult;
+            op->opretset = false;
+            op->opcollid = InvalidOid;
+            op->inputcollid = InvalidOid;
+            op->args = list_make1(arg);
+            op->location = -1;
+            ReleaseSysCache(optup);
+            return (Expr *)op;
+        }
+
         /* Operator-based functions (comparison + arithmetic) */
         auto opit = kOpNameMap.find(fname);
         if (opit != kOpNameMap.end())
@@ -1357,10 +1464,12 @@ convert_expression(const substrait::Expression &expr,
 
             Expr *left = convert_expression(sf.arguments(0).value(),
                                             schema, func_map,
-                                            virtuals, outer_schema);
+                                            virtuals, outer_schema,
+                                            window_query);
             Expr *right = convert_expression(sf.arguments(1).value(),
                                              schema, func_map,
-                                             virtuals, outer_schema);
+                                             virtuals, outer_schema,
+                                             window_query);
 
             Oid lefttype = exprType((Node *)left);
             Oid righttype = exprType((Node *)right);
@@ -1412,13 +1521,353 @@ convert_expression(const substrait::Expression &expr,
                         fname.c_str())));
     }
 
+    /* --- WindowFunction → WindowFunc --- */
+    if (expr.has_window_function())
+    {
+        const auto &wf = expr.window_function();
+
+        auto fit = func_map.find(wf.function_reference());
+        if (fit == func_map.end())
+            ereport(ERROR,
+                    (errmsg("substrait: unknown window function anchor %u",
+                            wf.function_reference())));
+
+        const std::string &substrait_name = fit->second;
+        auto nit = kAggNameMap.find(substrait_name);
+        const std::string pg_name =
+            (nit != kAggNameMap.end()) ? nit->second : substrait_name;
+
+        /* Convert arguments. */
+        List *args = NIL;
+        std::vector<Oid> argtypes_v;
+        bool is_star = (substrait_name == "count_star" ||
+                        (pg_name == "count" && wf.arguments_size() == 0));
+        if (!is_star)
+        {
+            for (const auto &arg : wf.arguments())
+            {
+                if (!arg.has_value()) continue;
+                Expr *e = convert_expression(arg.value(), schema, func_map,
+                                             virtuals, outer_schema, window_query);
+                TargetEntry *tle = makeTargetEntry(e, (AttrNumber)(list_length(args) + 1),
+                                                   NULL, false);
+                args = lappend(args, tle);
+                argtypes_v.push_back(exprType((Node *)e));
+            }
+        }
+
+        /* Look up the function OID. */
+        Oid funcoid;
+        if (is_star || pg_name == "count")
+            funcoid = lookup_count_star();
+        else
+        {
+            List *funcname = list_make1(makeString(pstrdup(pg_name.c_str())));
+            funcoid = LookupFuncName(funcname, (int)argtypes_v.size(),
+                                     argtypes_v.data(), false);
+        }
+
+        HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+        Oid rettype = ((Form_pg_proc)GETSTRUCT(proctup))->prorettype;
+        ReleaseSysCache(proctup);
+
+        /* Build or find a matching WindowClause on the query. */
+        Index winref = 0;
+        if (window_query)
+        {
+            /* Build partition clause. */
+            List *partitionClause = NIL;
+            Index next_sgref = 0;
+            ListCell *lc;
+            foreach (lc, window_query->targetList)
+            {
+                TargetEntry *tle = (TargetEntry *)lfirst(lc);
+                if (tle->ressortgroupref > next_sgref)
+                    next_sgref = tle->ressortgroupref;
+            }
+            next_sgref++;
+
+            for (const auto &pexpr : wf.partitions())
+            {
+                Expr *pe = convert_expression(pexpr, schema, func_map,
+                                              virtuals, outer_schema, window_query);
+                Oid ptype = exprType((Node *)pe);
+
+                /* Find or add matching targetlist entry. */
+                TargetEntry *match_tle = NULL;
+                foreach (lc, window_query->targetList)
+                {
+                    TargetEntry *tle = (TargetEntry *)lfirst(lc);
+                    if (equal(tle->expr, pe))
+                    {
+                        match_tle = tle;
+                        break;
+                    }
+                }
+                if (!match_tle)
+                {
+                    match_tle = makeTargetEntry(
+                        pe,
+                        (AttrNumber)(list_length(window_query->targetList) + 1),
+                        pstrdup("?partition?"), true);
+                    window_query->targetList = lappend(window_query->targetList,
+                                                       match_tle);
+                }
+                if (match_tle->ressortgroupref == 0)
+                    match_tle->ressortgroupref = next_sgref++;
+
+                Oid eqop, sortop;
+                bool hashable;
+                get_sort_group_operators(ptype, false, true, false,
+                                         &sortop, &eqop, NULL, &hashable);
+                SortGroupClause *sgc = makeNode(SortGroupClause);
+                sgc->tleSortGroupRef = match_tle->ressortgroupref;
+                sgc->eqop = eqop;
+                sgc->sortop = sortop;
+                sgc->nulls_first = false;
+                sgc->hashable = hashable;
+                partitionClause = lappend(partitionClause, sgc);
+            }
+
+            /* Frame options. */
+            int frameOptions = FRAMEOPTION_NONDEFAULT;
+            auto bt = wf.bounds_type();
+            /* 2 = RANGE, 1 = ROWS */
+            if (bt == 2 || bt == 0)
+                frameOptions |= FRAMEOPTION_RANGE;
+            else
+                frameOptions |= FRAMEOPTION_ROWS;
+
+            if (wf.has_lower_bound())
+            {
+                auto &lb = wf.lower_bound();
+                if (lb.has_unbounded())
+                    frameOptions |= FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+                else if (lb.has_current_row())
+                    frameOptions |= FRAMEOPTION_START_CURRENT_ROW;
+                else
+                    frameOptions |= FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+            }
+            else
+                frameOptions |= FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+
+            if (wf.has_upper_bound())
+            {
+                auto &ub = wf.upper_bound();
+                if (ub.has_unbounded())
+                    frameOptions |= FRAMEOPTION_END_UNBOUNDED_FOLLOWING;
+                else if (ub.has_current_row())
+                    frameOptions |= FRAMEOPTION_END_CURRENT_ROW;
+                else
+                    frameOptions |= FRAMEOPTION_END_UNBOUNDED_FOLLOWING;
+            }
+            else
+                frameOptions |= FRAMEOPTION_END_CURRENT_ROW;
+
+            WindowClause *wc = makeNode(WindowClause);
+            wc->name = NULL;
+            wc->refname = NULL;
+            wc->partitionClause = partitionClause;
+            wc->orderClause = NIL;
+            wc->frameOptions = frameOptions;
+            wc->startOffset = NULL;
+            wc->endOffset = NULL;
+            wc->startInRangeFunc = InvalidOid;
+            wc->endInRangeFunc = InvalidOid;
+            wc->inRangeColl = InvalidOid;
+            wc->inRangeAsc = true;
+            wc->inRangeNullsFirst = false;
+            wc->copiedOrder = false;
+
+            winref = (Index)(list_length(window_query->windowClause) + 1);
+            wc->winref = winref;
+            window_query->windowClause = lappend(window_query->windowClause, wc);
+            window_query->hasWindowFuncs = true;
+        }
+
+        WindowFunc *wfunc = makeNode(WindowFunc);
+        wfunc->winfnoid = funcoid;
+        wfunc->wintype = rettype;
+        wfunc->wincollid = InvalidOid;
+        wfunc->inputcollid = InvalidOid;
+        wfunc->args = args;
+        wfunc->aggfilter = NULL;
+        wfunc->winref = winref;
+        wfunc->winstar = is_star;
+        wfunc->winagg = true;
+        wfunc->location = -1;
+
+        return (Expr *)wfunc;
+    }
+
     ereport(ERROR,
             (errmsg("substrait: unsupported expression type")));
     return NULL; /* unreachable */
 }
 
 /* ============================================================
- * SECTION 6 - Top-level entry point
+ * SECTION 6 - SetRel (UNION / UNION ALL / INTERSECT / EXCEPT)
+ * ============================================================ */
+
+static Query *
+build_set_query(const substrait::SetRel &setrel, const FuncMap &func_map,
+                const SubstraitSchema *outer_schema)
+{
+    int ninputs = setrel.inputs_size();
+    if (ninputs < 2)
+        ereport(ERROR, (errmsg("substrait: SetRel needs >= 2 inputs")));
+
+    /* Map Substrait SetOp to PG SetOperation + all flag. */
+    SetOperation pg_op;
+    bool all;
+    switch (setrel.op())
+    {
+        case substrait::SetRel::SET_OP_UNION_ALL:
+            pg_op = SETOP_UNION; all = true; break;
+        case substrait::SetRel::SET_OP_UNION_DISTINCT:
+            pg_op = SETOP_UNION; all = false; break;
+        case substrait::SetRel::SET_OP_INTERSECTION_MULTISET:
+        case substrait::SetRel::SET_OP_INTERSECTION_PRIMARY:
+            pg_op = SETOP_INTERSECT; all = false; break;
+        case substrait::SetRel::SET_OP_INTERSECTION_MULTISET_ALL:
+            pg_op = SETOP_INTERSECT; all = true; break;
+        case substrait::SetRel::SET_OP_MINUS_PRIMARY:
+        case substrait::SetRel::SET_OP_MINUS_MULTISET:
+            pg_op = SETOP_EXCEPT; all = false; break;
+        case substrait::SetRel::SET_OP_MINUS_PRIMARY_ALL:
+            pg_op = SETOP_EXCEPT; all = true; break;
+        default:
+            ereport(ERROR,
+                    (errmsg("substrait: unsupported SetOp %d", (int)setrel.op())));
+    }
+
+    Query *query = makeNode(Query);
+    query->commandType = CMD_SELECT;
+    query->querySource = QSRC_ORIGINAL;
+    query->canSetTag = true;
+    query->rtable = NIL;
+    query->rteperminfos = NIL;
+    query->jointree = makeNode(FromExpr);
+    query->jointree->fromlist = NIL;
+    query->jointree->quals = NULL;
+
+    /* Build each input as a subquery, add to rtable. */
+    std::vector<int> rtindexes;
+    for (int i = 0; i < ninputs; i++)
+    {
+        Query *subq = build_query_for_rel(
+            &setrel.inputs(i), func_map, nullptr, outer_schema);
+
+        RangeTblEntry *rte = makeNode(RangeTblEntry);
+        rte->rtekind = RTE_SUBQUERY;
+        rte->subquery = subq;
+        rte->lateral = false;
+        rte->inh = false;
+        rte->inFromCl = true;
+
+        List *colnames = NIL;
+        ListCell *lc;
+        foreach (lc, subq->targetList)
+        {
+            TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            colnames = lappend(colnames,
+                makeString(pstrdup(tle->resname ? tle->resname : "?column?")));
+        }
+        char alias[16];
+        snprintf(alias, sizeof(alias), "u%d", i);
+        rte->eref = makeAlias(pstrdup(alias), colnames);
+
+        query->rtable = lappend(query->rtable, rte);
+        rtindexes.push_back(list_length(query->rtable));
+    }
+
+    /* Derive output column types from first input. */
+    Query *first = ((RangeTblEntry *)linitial(query->rtable))->subquery;
+    List *colTypes = NIL, *colTypmods = NIL, *colCollations = NIL;
+    List *groupClauses = NIL;
+    {
+        ListCell *lc;
+        Index sgref = 1;
+        foreach (lc, first->targetList)
+        {
+            TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            Oid coltype = exprType((Node *)tle->expr);
+            colTypes = lappend_oid(colTypes, coltype);
+            colTypmods = lappend_int(colTypmods, -1);
+            colCollations = lappend_oid(colCollations,
+                is_string_type(coltype) ? DEFAULT_COLLATION_OID : InvalidOid);
+
+            if (!all)
+            {
+                /* UNION DISTINCT needs groupClauses for dedup. */
+                Oid ltop, eqop, gtop;
+                bool hashable;
+                get_sort_group_operators(coltype, false, true, false,
+                                         &ltop, &eqop, &gtop, &hashable);
+                SortGroupClause *sgc = makeNode(SortGroupClause);
+                sgc->tleSortGroupRef = sgref++;
+                sgc->eqop = eqop;
+                sgc->sortop = ltop;
+                sgc->nulls_first = false;
+                sgc->hashable = hashable;
+                groupClauses = lappend(groupClauses, sgc);
+            }
+        }
+    }
+
+    /* Build left-deep tree of SetOperationStmt. */
+    auto make_leaf = [&](int idx) -> Node * {
+        RangeTblRef *rtr = makeNode(RangeTblRef);
+        rtr->rtindex = rtindexes[idx];
+        return (Node *)rtr;
+    };
+
+    Node *tree = make_leaf(0);
+    for (int i = 1; i < ninputs; i++)
+    {
+        SetOperationStmt *sos = makeNode(SetOperationStmt);
+        sos->op = pg_op;
+        sos->all = all;
+        sos->larg = tree;
+        sos->rarg = make_leaf(i);
+        sos->colTypes = colTypes;
+        sos->colTypmods = colTypmods;
+        sos->colCollations = colCollations;
+        sos->groupClauses = all ? NIL : groupClauses;
+        tree = (Node *)sos;
+    }
+    query->setOperations = tree;
+
+    /* Build target list referencing the output columns. */
+    List *tlist = NIL;
+    {
+        AttrNumber resno = 1;
+        ListCell *lc;
+        Index sgref = 1;
+        foreach (lc, first->targetList)
+        {
+            TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            Oid coltype = exprType((Node *)tle->expr);
+            Oid collation = is_string_type(coltype)
+                ? DEFAULT_COLLATION_OID : InvalidOid;
+            Var *var = makeVar(0, resno, coltype, -1, collation, 0);
+            TargetEntry *new_tle = makeTargetEntry(
+                (Expr *)var, resno,
+                pstrdup(tle->resname ? tle->resname : "?column?"),
+                false);
+            if (!all)
+                new_tle->ressortgroupref = sgref++;
+            tlist = lappend(tlist, new_tle);
+            resno++;
+        }
+    }
+    query->targetList = tlist;
+
+    return query;
+}
+
+/* ============================================================
+ * SECTION 7 - Top-level entry point
  *
  * build_query_for_rel: recursive core — builds a Query* from a Rel chain.
  * substrait_to_query: extern "C" entry — parses protobuf, delegates.
@@ -1575,8 +2024,10 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
     }
     else
     {
-        /* Nested rel chain (e.g., another Aggregate) — build as subquery. */
-        Query *subq = build_query_for_rel(cur, func_map, nullptr, outer_schema);
+        /* Nested rel chain or set operation — build as subquery. */
+        Query *subq = cur->has_set()
+            ? build_set_query(cur->set(), func_map, outer_schema)
+            : build_query_for_rel(cur, func_map, nullptr, outer_schema);
 
         RangeTblEntry *sub_rte = makeNode(RangeTblEntry);
         sub_rte->rtekind = RTE_SUBQUERY;
@@ -1717,7 +2168,7 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
         {
             Expr *expr = convert_expression(
                 project_rel->expressions(i), project_input_schema,
-                func_map, outer_virtuals);
+                func_map, outer_virtuals, nullptr, query);
 
             const char *colname = "expr";
             if (root != nullptr && name_idx < root->names_size())

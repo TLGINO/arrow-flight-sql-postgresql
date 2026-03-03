@@ -1,0 +1,1764 @@
+{
+  "extensionUris": [{
+    "extensionUriAnchor": 1,
+    "uri": "/functions_boolean.yaml"
+  }, {
+    "extensionUriAnchor": 4,
+    "uri": "/functions_arithmetic_decimal.yaml"
+  }, {
+    "extensionUriAnchor": 3,
+    "uri": "/functions_datetime.yaml"
+  }, {
+    "extensionUriAnchor": 2,
+    "uri": "/functions_comparison.yaml"
+  }],
+  "extensions": [{
+    "extensionFunction": {
+      "extensionUriReference": 1,
+      "functionAnchor": 1,
+      "name": "and:bool",
+      "extensionUrnReference": 1
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 2,
+      "functionAnchor": 2,
+      "name": "equal:any_any",
+      "extensionUrnReference": 2
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 3,
+      "functionAnchor": 3,
+      "name": "gte:date_date",
+      "extensionUrnReference": 3
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 3,
+      "functionAnchor": 4,
+      "name": "lte:date_date",
+      "extensionUrnReference": 3
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 3,
+      "functionAnchor": 5,
+      "name": "add:date_iday",
+      "extensionUrnReference": 3
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 2,
+      "functionAnchor": 6,
+      "name": "gt:any_any",
+      "extensionUrnReference": 2
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 4,
+      "functionAnchor": 7,
+      "name": "avg:dec",
+      "extensionUrnReference": 4
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 4,
+      "functionAnchor": 8,
+      "name": "multiply:dec_dec",
+      "extensionUrnReference": 4
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 4,
+      "functionAnchor": 9,
+      "name": "sum:dec",
+      "extensionUrnReference": 4
+    }
+  }],
+  "relations": [{
+    "root": {
+      "input": {
+        "fetch": {
+          "common": {
+            "direct": {
+            }
+          },
+          "input": {
+            "aggregate": {
+              "common": {
+                "direct": {
+                }
+              },
+              "input": {
+                "project": {
+                  "common": {
+                    "emit": {
+                      "outputMapping": [84]
+                    }
+                  },
+                  "input": {
+                    "filter": {
+                      "common": {
+                        "direct": {
+                        }
+                      },
+                      "input": {
+                        "cross": {
+                          "common": {
+                            "direct": {
+                            }
+                          },
+                          "left": {
+                            "cross": {
+                              "common": {
+                                "direct": {
+                                }
+                              },
+                              "left": {
+                                "read": {
+                                  "common": {
+                                    "direct": {
+                                    }
+                                  },
+                                  "baseSchema": {
+                                    "names": ["CS_SOLD_DATE_SK", "CS_SOLD_TIME_SK", "CS_SHIP_DATE_SK", "CS_BILL_CUSTOMER_SK", "CS_BILL_CDEMO_SK", "CS_BILL_HDEMO_SK", "CS_BILL_ADDR_SK", "CS_SHIP_CUSTOMER_SK", "CS_SHIP_CDEMO_SK", "CS_SHIP_HDEMO_SK", "CS_SHIP_ADDR_SK", "CS_CALL_CENTER_SK", "CS_CATALOG_PAGE_SK", "CS_SHIP_MODE_SK", "CS_WAREHOUSE_SK", "CS_ITEM_SK", "CS_PROMO_SK", "CS_ORDER_NUMBER", "CS_QUANTITY", "CS_WHOLESALE_COST", "CS_LIST_PRICE", "CS_SALES_PRICE", "CS_EXT_DISCOUNT_AMT", "CS_EXT_SALES_PRICE", "CS_EXT_WHOLESALE_COST", "CS_EXT_LIST_PRICE", "CS_EXT_TAX", "CS_COUPON_AMT", "CS_EXT_SHIP_COST", "CS_NET_PAID", "CS_NET_PAID_INC_TAX", "CS_NET_PAID_INC_SHIP", "CS_NET_PAID_INC_SHIP_TAX", "CS_NET_PROFIT"],
+                                    "struct": {
+                                      "types": [{
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i32": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }],
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  },
+                                  "namedTable": {
+                                    "names": ["tpcds", "CATALOG_SALES"]
+                                  }
+                                }
+                              },
+                              "right": {
+                                "read": {
+                                  "common": {
+                                    "direct": {
+                                    }
+                                  },
+                                  "baseSchema": {
+                                    "names": ["I_ITEM_SK", "I_ITEM_ID", "I_REC_START_DATE", "I_REC_END_DATE", "I_ITEM_DESC", "I_CURRENT_PRICE", "I_WHOLESALE_COST", "I_BRAND_ID", "I_BRAND", "I_CLASS_ID", "I_CLASS", "I_CATEGORY_ID", "I_CATEGORY", "I_MANUFACT_ID", "I_MANUFACT", "I_SIZE", "I_FORMULATION", "I_COLOR", "I_UNITS", "I_CONTAINER", "I_MANAGER_ID", "I_PRODUCT_NAME"],
+                                    "struct": {
+                                      "types": [{
+                                        "i64": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 16,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "date": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "date": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "varchar": {
+                                          "length": 200,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "decimal": {
+                                          "scale": 2,
+                                          "precision": 7,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i32": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 50,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i32": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 50,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i32": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 50,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i32": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 50,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 20,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 20,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 20,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 10,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 10,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "i32": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }, {
+                                        "fixedChar": {
+                                          "length": 50,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      }],
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  },
+                                  "namedTable": {
+                                    "names": ["tpcds", "ITEM"]
+                                  }
+                                }
+                              }
+                            }
+                          },
+                          "right": {
+                            "read": {
+                              "common": {
+                                "direct": {
+                                }
+                              },
+                              "baseSchema": {
+                                "names": ["D_DATE_SK", "D_DATE_ID", "D_DATE", "D_MONTH_SEQ", "D_WEEK_SEQ", "D_QUARTER_SEQ", "D_YEAR", "D_DOW", "D_MOY", "D_DOM", "D_QOY", "D_FY_YEAR", "D_FY_QUARTER_SEQ", "D_FY_WEEK_SEQ", "D_DAY_NAME", "D_QUARTER_NAME", "D_HOLIDAY", "D_WEEKEND", "D_FOLLOWING_HOLIDAY", "D_FIRST_DOM", "D_LAST_DOM", "D_SAME_DAY_LY", "D_SAME_DAY_LQ", "D_CURRENT_DAY", "D_CURRENT_WEEK", "D_CURRENT_MONTH", "D_CURRENT_QUARTER", "D_CURRENT_YEAR"],
+                                "struct": {
+                                  "types": [{
+                                    "i64": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 16,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "date": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 9,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 6,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "i32": {
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }, {
+                                    "fixedChar": {
+                                      "length": 1,
+                                      "typeVariationReference": 0,
+                                      "nullability": "NULLABILITY_REQUIRED"
+                                    }
+                                  }],
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_REQUIRED"
+                                }
+                              },
+                              "namedTable": {
+                                "names": ["tpcds", "DATE_DIM"]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "condition": {
+                        "scalarFunction": {
+                          "functionReference": 1,
+                          "args": [],
+                          "outputType": {
+                            "bool": {
+                              "typeVariationReference": 0,
+                              "nullability": "NULLABILITY_NULLABLE"
+                            }
+                          },
+                          "arguments": [{
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 2,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_REQUIRED"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 47
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "literal": {
+                                      "i32": 361,
+                                      "nullable": false,
+                                      "typeVariationReference": 0
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }, {
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 2,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_REQUIRED"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 34
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 15
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }, {
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 3,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_REQUIRED"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 58
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "cast": {
+                                      "type": {
+                                        "date": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      },
+                                      "input": {
+                                        "literal": {
+                                          "fixedChar": "2000-01-27",
+                                          "nullable": false,
+                                          "typeVariationReference": 0
+                                        }
+                                      },
+                                      "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }, {
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 4,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_REQUIRED"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 58
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 5,
+                                      "args": [],
+                                      "outputType": {
+                                        "date": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "cast": {
+                                            "type": {
+                                              "date": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_REQUIRED"
+                                              }
+                                            },
+                                            "input": {
+                                              "literal": {
+                                                "fixedChar": "2000-01-27",
+                                                "nullable": false,
+                                                "typeVariationReference": 0
+                                              }
+                                            },
+                                            "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "intervalDayToSecond": {
+                                              "days": 90,
+                                              "seconds": 0,
+                                              "precision": 6,
+                                              "subseconds": "0"
+                                            },
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }, {
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 2,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_REQUIRED"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 56
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 0
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }, {
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 6,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_NULLABLE"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "cast": {
+                                      "type": {
+                                        "decimal": {
+                                          "scale": 3,
+                                          "precision": 9,
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_REQUIRED"
+                                        }
+                                      },
+                                      "input": {
+                                        "selection": {
+                                          "directReference": {
+                                            "structField": {
+                                              "field": 22
+                                            }
+                                          },
+                                          "rootReference": {
+                                          }
+                                        }
+                                      },
+                                      "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "subquery": {
+                                      "scalar": {
+                                        "input": {
+                                          "project": {
+                                            "common": {
+                                              "emit": {
+                                                "outputMapping": [1]
+                                              }
+                                            },
+                                            "input": {
+                                              "aggregate": {
+                                                "common": {
+                                                  "direct": {
+                                                  }
+                                                },
+                                                "input": {
+                                                  "project": {
+                                                    "common": {
+                                                      "emit": {
+                                                        "outputMapping": [62]
+                                                      }
+                                                    },
+                                                    "input": {
+                                                      "filter": {
+                                                        "common": {
+                                                          "direct": {
+                                                          }
+                                                        },
+                                                        "input": {
+                                                          "cross": {
+                                                            "common": {
+                                                              "direct": {
+                                                              }
+                                                            },
+                                                            "left": {
+                                                              "read": {
+                                                                "common": {
+                                                                  "direct": {
+                                                                  }
+                                                                },
+                                                                "baseSchema": {
+                                                                  "names": ["CS_SOLD_DATE_SK", "CS_SOLD_TIME_SK", "CS_SHIP_DATE_SK", "CS_BILL_CUSTOMER_SK", "CS_BILL_CDEMO_SK", "CS_BILL_HDEMO_SK", "CS_BILL_ADDR_SK", "CS_SHIP_CUSTOMER_SK", "CS_SHIP_CDEMO_SK", "CS_SHIP_HDEMO_SK", "CS_SHIP_ADDR_SK", "CS_CALL_CENTER_SK", "CS_CATALOG_PAGE_SK", "CS_SHIP_MODE_SK", "CS_WAREHOUSE_SK", "CS_ITEM_SK", "CS_PROMO_SK", "CS_ORDER_NUMBER", "CS_QUANTITY", "CS_WHOLESALE_COST", "CS_LIST_PRICE", "CS_SALES_PRICE", "CS_EXT_DISCOUNT_AMT", "CS_EXT_SALES_PRICE", "CS_EXT_WHOLESALE_COST", "CS_EXT_LIST_PRICE", "CS_EXT_TAX", "CS_COUPON_AMT", "CS_EXT_SHIP_COST", "CS_NET_PAID", "CS_NET_PAID_INC_TAX", "CS_NET_PAID_INC_SHIP", "CS_NET_PAID_INC_SHIP_TAX", "CS_NET_PROFIT"],
+                                                                  "struct": {
+                                                                    "types": [{
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "decimal": {
+                                                                        "scale": 2,
+                                                                        "precision": 7,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }],
+                                                                    "typeVariationReference": 0,
+                                                                    "nullability": "NULLABILITY_REQUIRED"
+                                                                  }
+                                                                },
+                                                                "namedTable": {
+                                                                  "names": ["tpcds", "CATALOG_SALES"]
+                                                                }
+                                                              }
+                                                            },
+                                                            "right": {
+                                                              "read": {
+                                                                "common": {
+                                                                  "direct": {
+                                                                  }
+                                                                },
+                                                                "baseSchema": {
+                                                                  "names": ["D_DATE_SK", "D_DATE_ID", "D_DATE", "D_MONTH_SEQ", "D_WEEK_SEQ", "D_QUARTER_SEQ", "D_YEAR", "D_DOW", "D_MOY", "D_DOM", "D_QOY", "D_FY_YEAR", "D_FY_QUARTER_SEQ", "D_FY_WEEK_SEQ", "D_DAY_NAME", "D_QUARTER_NAME", "D_HOLIDAY", "D_WEEKEND", "D_FOLLOWING_HOLIDAY", "D_FIRST_DOM", "D_LAST_DOM", "D_SAME_DAY_LY", "D_SAME_DAY_LQ", "D_CURRENT_DAY", "D_CURRENT_WEEK", "D_CURRENT_MONTH", "D_CURRENT_QUARTER", "D_CURRENT_YEAR"],
+                                                                  "struct": {
+                                                                    "types": [{
+                                                                      "i64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 16,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "date": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 9,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 6,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "i32": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }, {
+                                                                      "fixedChar": {
+                                                                        "length": 1,
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    }],
+                                                                    "typeVariationReference": 0,
+                                                                    "nullability": "NULLABILITY_REQUIRED"
+                                                                  }
+                                                                },
+                                                                "namedTable": {
+                                                                  "names": ["tpcds", "DATE_DIM"]
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        },
+                                                        "condition": {
+                                                          "scalarFunction": {
+                                                            "functionReference": 1,
+                                                            "args": [],
+                                                            "outputType": {
+                                                              "bool": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_REQUIRED"
+                                                              }
+                                                            },
+                                                            "arguments": [{
+                                                              "value": {
+                                                                "scalarFunction": {
+                                                                  "functionReference": 2,
+                                                                  "args": [],
+                                                                  "outputType": {
+                                                                    "bool": {
+                                                                      "typeVariationReference": 0,
+                                                                      "nullability": "NULLABILITY_REQUIRED"
+                                                                    }
+                                                                  },
+                                                                  "arguments": [{
+                                                                    "value": {
+                                                                      "selection": {
+                                                                        "directReference": {
+                                                                          "structField": {
+                                                                            "field": 15
+                                                                          }
+                                                                        },
+                                                                        "rootReference": {
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }, {
+                                                                    "value": {
+                                                                      "selection": {
+                                                                        "directReference": {
+                                                                          "structField": {
+                                                                            "field": 34
+                                                                          }
+                                                                        },
+                                                                        "outerReference": {
+                                                                          "stepsOut": 1
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }],
+                                                                  "options": []
+                                                                }
+                                                              }
+                                                            }, {
+                                                              "value": {
+                                                                "scalarFunction": {
+                                                                  "functionReference": 3,
+                                                                  "args": [],
+                                                                  "outputType": {
+                                                                    "bool": {
+                                                                      "typeVariationReference": 0,
+                                                                      "nullability": "NULLABILITY_REQUIRED"
+                                                                    }
+                                                                  },
+                                                                  "arguments": [{
+                                                                    "value": {
+                                                                      "selection": {
+                                                                        "directReference": {
+                                                                          "structField": {
+                                                                            "field": 36
+                                                                          }
+                                                                        },
+                                                                        "rootReference": {
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }, {
+                                                                    "value": {
+                                                                      "cast": {
+                                                                        "type": {
+                                                                          "date": {
+                                                                            "typeVariationReference": 0,
+                                                                            "nullability": "NULLABILITY_REQUIRED"
+                                                                          }
+                                                                        },
+                                                                        "input": {
+                                                                          "literal": {
+                                                                            "fixedChar": "2000-01-27",
+                                                                            "nullable": false,
+                                                                            "typeVariationReference": 0
+                                                                          }
+                                                                        },
+                                                                        "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                                                      }
+                                                                    }
+                                                                  }],
+                                                                  "options": []
+                                                                }
+                                                              }
+                                                            }, {
+                                                              "value": {
+                                                                "scalarFunction": {
+                                                                  "functionReference": 4,
+                                                                  "args": [],
+                                                                  "outputType": {
+                                                                    "bool": {
+                                                                      "typeVariationReference": 0,
+                                                                      "nullability": "NULLABILITY_REQUIRED"
+                                                                    }
+                                                                  },
+                                                                  "arguments": [{
+                                                                    "value": {
+                                                                      "selection": {
+                                                                        "directReference": {
+                                                                          "structField": {
+                                                                            "field": 36
+                                                                          }
+                                                                        },
+                                                                        "rootReference": {
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }, {
+                                                                    "value": {
+                                                                      "scalarFunction": {
+                                                                        "functionReference": 5,
+                                                                        "args": [],
+                                                                        "outputType": {
+                                                                          "date": {
+                                                                            "typeVariationReference": 0,
+                                                                            "nullability": "NULLABILITY_REQUIRED"
+                                                                          }
+                                                                        },
+                                                                        "arguments": [{
+                                                                          "value": {
+                                                                            "cast": {
+                                                                              "type": {
+                                                                                "date": {
+                                                                                  "typeVariationReference": 0,
+                                                                                  "nullability": "NULLABILITY_REQUIRED"
+                                                                                }
+                                                                              },
+                                                                              "input": {
+                                                                                "literal": {
+                                                                                  "fixedChar": "2000-01-27",
+                                                                                  "nullable": false,
+                                                                                  "typeVariationReference": 0
+                                                                                }
+                                                                              },
+                                                                              "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                                                            }
+                                                                          }
+                                                                        }, {
+                                                                          "value": {
+                                                                            "literal": {
+                                                                              "intervalDayToSecond": {
+                                                                                "days": 90,
+                                                                                "seconds": 0,
+                                                                                "precision": 6,
+                                                                                "subseconds": "0"
+                                                                              },
+                                                                              "nullable": false,
+                                                                              "typeVariationReference": 0
+                                                                            }
+                                                                          }
+                                                                        }],
+                                                                        "options": []
+                                                                      }
+                                                                    }
+                                                                  }],
+                                                                  "options": []
+                                                                }
+                                                              }
+                                                            }, {
+                                                              "value": {
+                                                                "scalarFunction": {
+                                                                  "functionReference": 2,
+                                                                  "args": [],
+                                                                  "outputType": {
+                                                                    "bool": {
+                                                                      "typeVariationReference": 0,
+                                                                      "nullability": "NULLABILITY_REQUIRED"
+                                                                    }
+                                                                  },
+                                                                  "arguments": [{
+                                                                    "value": {
+                                                                      "selection": {
+                                                                        "directReference": {
+                                                                          "structField": {
+                                                                            "field": 34
+                                                                          }
+                                                                        },
+                                                                        "rootReference": {
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }, {
+                                                                    "value": {
+                                                                      "selection": {
+                                                                        "directReference": {
+                                                                          "structField": {
+                                                                            "field": 0
+                                                                          }
+                                                                        },
+                                                                        "rootReference": {
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }],
+                                                                  "options": []
+                                                                }
+                                                              }
+                                                            }],
+                                                            "options": []
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "expressions": [{
+                                                      "selection": {
+                                                        "directReference": {
+                                                          "structField": {
+                                                            "field": 22
+                                                          }
+                                                        },
+                                                        "rootReference": {
+                                                        }
+                                                      }
+                                                    }]
+                                                  }
+                                                },
+                                                "groupings": [{
+                                                  "groupingExpressions": [],
+                                                  "expressionReferences": []
+                                                }],
+                                                "measures": [{
+                                                  "measure": {
+                                                    "functionReference": 7,
+                                                    "args": [],
+                                                    "sorts": [],
+                                                    "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
+                                                    "outputType": {
+                                                      "decimal": {
+                                                        "scale": 2,
+                                                        "precision": 7,
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    },
+                                                    "invocation": "AGGREGATION_INVOCATION_ALL",
+                                                    "arguments": [{
+                                                      "value": {
+                                                        "selection": {
+                                                          "directReference": {
+                                                            "structField": {
+                                                              "field": 0
+                                                            }
+                                                          },
+                                                          "rootReference": {
+                                                          }
+                                                        }
+                                                      }
+                                                    }],
+                                                    "options": []
+                                                  }
+                                                }],
+                                                "groupingExpressions": []
+                                              }
+                                            },
+                                            "expressions": [{
+                                              "scalarFunction": {
+                                                "functionReference": 8,
+                                                "args": [],
+                                                "outputType": {
+                                                  "decimal": {
+                                                    "scale": 3,
+                                                    "precision": 9,
+                                                    "typeVariationReference": 0,
+                                                    "nullability": "NULLABILITY_NULLABLE"
+                                                  }
+                                                },
+                                                "arguments": [{
+                                                  "value": {
+                                                    "literal": {
+                                                      "decimal": {
+                                                        "value": "DQAAAAAAAAAAAAAAAAAAAA==",
+                                                        "precision": 2,
+                                                        "scale": 1
+                                                      },
+                                                      "nullable": false,
+                                                      "typeVariationReference": 0
+                                                    }
+                                                  }
+                                                }, {
+                                                  "value": {
+                                                    "selection": {
+                                                      "directReference": {
+                                                        "structField": {
+                                                          "field": 0
+                                                        }
+                                                      },
+                                                      "rootReference": {
+                                                      }
+                                                    }
+                                                  }
+                                                }],
+                                                "options": []
+                                              }
+                                            }]
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }],
+                          "options": []
+                        }
+                      }
+                    }
+                  },
+                  "expressions": [{
+                    "selection": {
+                      "directReference": {
+                        "structField": {
+                          "field": 22
+                        }
+                      },
+                      "rootReference": {
+                      }
+                    }
+                  }]
+                }
+              },
+              "groupings": [{
+                "groupingExpressions": [],
+                "expressionReferences": []
+              }],
+              "measures": [{
+                "measure": {
+                  "functionReference": 9,
+                  "args": [],
+                  "sorts": [],
+                  "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
+                  "outputType": {
+                    "decimal": {
+                      "scale": 2,
+                      "precision": 7,
+                      "typeVariationReference": 0,
+                      "nullability": "NULLABILITY_NULLABLE"
+                    }
+                  },
+                  "invocation": "AGGREGATION_INVOCATION_ALL",
+                  "arguments": [{
+                    "value": {
+                      "selection": {
+                        "directReference": {
+                          "structField": {
+                            "field": 0
+                          }
+                        },
+                        "rootReference": {
+                        }
+                      }
+                    }
+                  }],
+                  "options": []
+                }
+              }],
+              "groupingExpressions": []
+            }
+          },
+          "offset": "0",
+          "count": "100"
+        }
+      },
+      "names": ["excess discount amount"]
+    }
+  }],
+  "expectedTypeUrls": [],
+  "version": {
+    "majorNumber": 0,
+    "minorNumber": 81,
+    "patchNumber": 0,
+    "gitHash": "",
+    "producer": "isthmus"
+  },
+  "parameterBindings": [],
+  "extensionUrns": [{
+    "extensionUrnAnchor": 4,
+    "urn": "extension:io.substrait:functions_arithmetic_decimal"
+  }, {
+    "extensionUrnAnchor": 2,
+    "urn": "extension:io.substrait:functions_comparison"
+  }, {
+    "extensionUrnAnchor": 3,
+    "urn": "extension:io.substrait:functions_datetime"
+  }, {
+    "extensionUrnAnchor": 1,
+    "urn": "extension:io.substrait:functions_boolean"
+  }],
+  "typeAliases": []
+}
