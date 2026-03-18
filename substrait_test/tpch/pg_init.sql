@@ -1,106 +1,100 @@
--- TPC-H schema with UPPERCASE quoted identifiers (matching Isthmus plans).
--- Data loaded from pipe-delimited .tbl files.
--- Set :tpch_data_dir via psql -v before running, e.g.:
---   psql -v tpch_data_dir=/path/to/data -f pg_init.sql
+DROP SCHEMA IF EXISTS tpch CASCADE;
+CREATE SCHEMA tpch;
 
-DROP TABLE IF EXISTS "LINEITEM" CASCADE;
-DROP TABLE IF EXISTS "ORDERS" CASCADE;
-DROP TABLE IF EXISTS "PARTSUPP" CASCADE;
-DROP TABLE IF EXISTS "CUSTOMER" CASCADE;
-DROP TABLE IF EXISTS "SUPPLIER" CASCADE;
-DROP TABLE IF EXISTS "PART" CASCADE;
-DROP TABLE IF EXISTS "NATION" CASCADE;
-DROP TABLE IF EXISTS "REGION" CASCADE;
-
-CREATE TABLE "REGION" (
-  "R_REGIONKEY" BIGINT NOT NULL,
-  "R_NAME" CHAR(25) NOT NULL,
-  "R_COMMENT" VARCHAR(152),
-  PRIMARY KEY ("R_REGIONKEY")
+CREATE TABLE tpch.customer (
+  c_custkey BIGINT,
+  c_name VARCHAR(25),
+  c_address VARCHAR(40),
+  c_nationkey BIGINT,
+  c_phone CHAR(15),
+  c_acctbal DECIMAL,
+  c_mktsegment CHAR(10),
+  c_comment VARCHAR(117)
 );
 
-CREATE TABLE "NATION" (
-  "N_NATIONKEY" BIGINT NOT NULL,
-  "N_NAME" VARCHAR(25) NOT NULL,
-  "N_REGIONKEY" BIGINT NOT NULL,
-  "N_COMMENT" VARCHAR(152),
-  PRIMARY KEY ("N_NATIONKEY")
+CREATE TABLE tpch.lineitem (
+  l_orderkey BIGINT,
+  l_partkey BIGINT,
+  l_suppkey BIGINT,
+  l_linenumber INTEGER,
+  l_quantity DECIMAL,
+  l_extendedprice DECIMAL,
+  l_discount DECIMAL,
+  l_tax DECIMAL,
+  l_returnflag CHAR(1),
+  l_linestatus CHAR(1),
+  l_shipdate DATE,
+  l_commitdate DATE,
+  l_receiptdate DATE,
+  l_shipinstruct CHAR(25),
+  l_shipmode CHAR(10),
+  l_comment VARCHAR(44)
 );
 
-CREATE TABLE "PART" (
-  "P_PARTKEY" BIGINT NOT NULL,
-  "P_NAME" VARCHAR(55) NOT NULL,
-  "P_MFGR" VARCHAR(25) NOT NULL,
-  "P_BRAND" VARCHAR(10) NOT NULL,
-  "P_TYPE" VARCHAR(25) NOT NULL,
-  "P_SIZE" INTEGER NOT NULL,
-  "P_CONTAINER" VARCHAR(10) NOT NULL,
-  "P_RETAILPRICE" DECIMAL(15,2) NOT NULL,
-  "P_COMMENT" VARCHAR(23) NOT NULL,
-  PRIMARY KEY ("P_PARTKEY")
+CREATE TABLE tpch.nation (
+  n_nationkey BIGINT,
+  n_name CHAR(25),
+  n_regionkey BIGINT,
+  n_comment VARCHAR(152)
 );
 
-CREATE TABLE "SUPPLIER" (
-  "S_SUPPKEY" BIGINT NOT NULL,
-  "S_NAME" CHAR(25) NOT NULL,
-  "S_ADDRESS" VARCHAR(40) NOT NULL,
-  "S_NATIONKEY" BIGINT NOT NULL,
-  "S_PHONE" CHAR(15) NOT NULL,
-  "S_ACCTBAL" DECIMAL(15,2) NOT NULL,
-  "S_COMMENT" VARCHAR(101) NOT NULL,
-  PRIMARY KEY ("S_SUPPKEY")
+CREATE TABLE tpch.orders (
+  o_orderkey BIGINT,
+  o_custkey BIGINT,
+  o_orderstatus CHAR(1),
+  o_totalprice DECIMAL,
+  o_orderdate DATE,
+  o_orderpriority CHAR(15),
+  o_clerk CHAR(15),
+  o_shippriority INTEGER,
+  o_comment VARCHAR(79)
 );
 
-CREATE TABLE "PARTSUPP" (
-  "PS_PARTKEY" BIGINT NOT NULL,
-  "PS_SUPPKEY" BIGINT NOT NULL,
-  "PS_AVAILQTY" INTEGER NOT NULL,
-  "PS_SUPPLYCOST" DECIMAL(15,2) NOT NULL,
-  "PS_COMMENT" VARCHAR(199) NOT NULL,
-  PRIMARY KEY ("PS_PARTKEY", "PS_SUPPKEY")
+CREATE TABLE tpch.part (
+  p_partkey BIGINT,
+  p_name VARCHAR(55),
+  p_mfgr CHAR(25),
+  p_brand CHAR(10),
+  p_type VARCHAR(25),
+  p_size INTEGER,
+  p_container CHAR(10),
+  p_retailprice DECIMAL,
+  p_comment VARCHAR(23)
 );
 
-CREATE TABLE "CUSTOMER" (
-  "C_CUSTKEY" BIGINT NOT NULL,
-  "C_NAME" VARCHAR(25) NOT NULL,
-  "C_ADDRESS" VARCHAR(40) NOT NULL,
-  "C_NATIONKEY" BIGINT NOT NULL,
-  "C_PHONE" CHAR(15) NOT NULL,
-  "C_ACCTBAL" DECIMAL(15,2) NOT NULL,
-  "C_MKTSEGMENT" CHAR(10) NOT NULL,
-  "C_COMMENT" VARCHAR(117) NOT NULL,
-  PRIMARY KEY ("C_CUSTKEY")
+CREATE TABLE tpch.partsupp (
+  ps_partkey BIGINT,
+  ps_suppkey BIGINT,
+  ps_availqty INTEGER,
+  ps_supplycost DECIMAL,
+  ps_comment VARCHAR(199)
 );
 
-CREATE TABLE "ORDERS" (
-  "O_ORDERKEY" BIGINT NOT NULL,
-  "O_CUSTKEY" BIGINT NOT NULL,
-  "O_ORDERSTATUS" CHAR(1) NOT NULL,
-  "O_TOTALPRICE" DECIMAL(15,2) NOT NULL,
-  "O_ORDERDATE" DATE NOT NULL,
-  "O_ORDERPRIORITY" CHAR(15) NOT NULL,
-  "O_CLERK" CHAR(15) NOT NULL,
-  "O_SHIPPRIORITY" INTEGER NOT NULL,
-  "O_COMMENT" VARCHAR(79) NOT NULL,
-  PRIMARY KEY ("O_ORDERKEY")
+CREATE TABLE tpch.region (
+  r_regionkey BIGINT,
+  r_name CHAR(25),
+  r_comment VARCHAR(152)
 );
 
-CREATE TABLE "LINEITEM" (
-  "L_ORDERKEY" BIGINT NOT NULL,
-  "L_PARTKEY" BIGINT NOT NULL,
-  "L_SUPPKEY" BIGINT NOT NULL,
-  "L_LINENUMBER" INTEGER NOT NULL,
-  "L_QUANTITY" DECIMAL(15,2) NOT NULL,
-  "L_EXTENDEDPRICE" DECIMAL(15,2) NOT NULL,
-  "L_DISCOUNT" DECIMAL(15,2) NOT NULL,
-  "L_TAX" DECIMAL(15,2) NOT NULL,
-  "L_RETURNFLAG" CHAR(1) NOT NULL,
-  "L_LINESTATUS" CHAR(1) NOT NULL,
-  "L_SHIPDATE" DATE NOT NULL,
-  "L_COMMITDATE" DATE NOT NULL,
-  "L_RECEIPTDATE" DATE NOT NULL,
-  "L_SHIPINSTRUCT" CHAR(25) NOT NULL,
-  "L_SHIPMODE" CHAR(10) NOT NULL,
-  "L_COMMENT" VARCHAR(44) NOT NULL,
-  PRIMARY KEY ("L_ORDERKEY", "L_LINENUMBER")
+CREATE TABLE tpch.supplier (
+  s_suppkey BIGINT,
+  s_name CHAR(25),
+  s_address VARCHAR(40),
+  s_nationkey BIGINT,
+  s_phone CHAR(15),
+  s_acctbal DECIMAL,
+  s_comment VARCHAR(101)
 );
+
+-- Indexes for correlated subquery performance
+CREATE INDEX idx_lineitem_orderkey ON tpch.lineitem (l_orderkey);
+CREATE INDEX idx_lineitem_partkey_suppkey ON tpch.lineitem (l_partkey, l_suppkey);
+CREATE INDEX idx_lineitem_suppkey ON tpch.lineitem (l_suppkey);
+CREATE INDEX idx_orders_orderkey ON tpch.orders (o_orderkey);
+CREATE INDEX idx_partsupp_partkey ON tpch.partsupp (ps_partkey);
+CREATE INDEX idx_supplier_suppkey ON tpch.supplier (s_suppkey);
+CREATE INDEX idx_part_partkey ON tpch.part (p_partkey);
+CREATE INDEX idx_nation_nationkey ON tpch.nation (n_nationkey);
+CREATE INDEX idx_customer_custkey ON tpch.customer (c_custkey);
+
+ALTER DATABASE postgres SET search_path TO public, tpch;

@@ -1238,10 +1238,28 @@ class NumericToDecimal128Builder : public ArrowArrayBuilderBase {
 				arrow::Decimal128::FromString(str, &val, &precision, &scale));
 			if (scale != target_scale_)
 			{
-				auto rescaled = val.Rescale(scale, target_scale_);
-				if (!rescaled.ok())
-					return rescaled.status();
-				val = std::move(rescaled).ValueUnsafe();
+				if (scale > target_scale_)
+				{
+					/* Round to target scale to avoid data-loss error.
+					 * Divide by 10^(scale - target_scale_), rounding
+					 * half-away-from-zero. */
+					int32_t diff = scale - target_scale_;
+					arrow::Decimal128 divisor(1);
+					for (int32_t d = 0; d < diff; d++)
+						divisor *= arrow::Decimal128(10);
+					arrow::Decimal128 half = divisor / arrow::Decimal128(2);
+					if (val >= arrow::Decimal128(0))
+						val = (val + half) / divisor;
+					else
+						val = (val - half) / divisor;
+				}
+				else
+				{
+					auto rescaled = val.Rescale(scale, target_scale_);
+					if (!rescaled.ok())
+						return rescaled.status();
+					val = std::move(rescaled).ValueUnsafe();
+				}
 			}
 			pfree(str);
 			return builder_->Append(val);
@@ -2009,6 +2027,7 @@ class Executor : public WorkerProcessor {
 
 		P("%s: %s: %s: plan size: %" PRIsize, Tag, tag_, tag, planSize);
 
+			try
 		{
 			ScopedTransaction scopedTransaction;
 			ScopedSnapshot scopedSnapshot;
@@ -2029,7 +2048,37 @@ class Executor : public WorkerProcessor {
 				PGC_USERSET, PGC_S_SESSION,
 				GUC_ACTION_LOCAL, true, ERROR, false);
 
-			PlannedStmt* pstmt = standard_planner(query, "<substrait>", 0, NULL);
+			/* Debug: dump query tree before planning */
+			{
+				char *tree = nodeToString(query);
+				std::ofstream dbg("/tmp/q5tree_current.txt");
+				if (dbg) dbg << tree;
+				pfree(tree);
+				elog(LOG, "AFS Q5DBG: hasGroupRTE=%d hasAggs=%d rtable=%d groupClause=%d groupingSets=%d",
+					query->hasGroupRTE, query->hasAggs,
+					list_length(query->rtable),
+					list_length(query->groupClause),
+					list_length(query->groupingSets));
+			}
+
+			PlannedStmt* pstmt;
+			PG_TRY();
+			{
+				pstmt = standard_planner(query, "<substrait>", 0, NULL);
+			}
+			PG_CATCH();
+			{
+				ErrorData *edata = CopyErrorData();
+				elog(LOG, "AFS Q5DBG FAIL: %s (detail: %s, file: %s:%d func: %s)",
+					edata->message ? edata->message : "(null)",
+					edata->detail ? edata->detail : "(null)",
+					edata->filename ? edata->filename : "?",
+					edata->lineno,
+					edata->funcname ? edata->funcname : "?");
+				FreeErrorData(edata);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
 
 			PushActiveSnapshot(GetTransactionSnapshot());
 
@@ -2093,6 +2142,27 @@ class Executor : public WorkerProcessor {
 				dsa_free(area_, session->substraitPlan);
 				session->substraitPlan = InvalidDsaPointer;
 				session->substraitPlanSize = 0;
+			}
+
+			signal_server(tag);
+		}
+		catch (const std::bad_alloc& e)
+		{
+			set_error_message(
+				session,
+				std::string(Tag) + ": " + tag_ + ": " + tag +
+					": out of memory: " + e.what(),
+				tag);
+
+			// Free the shared memory plan data
+			{
+				ProcessorLockGuard lock(this);
+				if (session->substraitPlan != InvalidDsaPointer)
+				{
+					dsa_free(area_, session->substraitPlan);
+					session->substraitPlan = InvalidDsaPointer;
+					session->substraitPlanSize = 0;
+				}
 			}
 
 			signal_server(tag);

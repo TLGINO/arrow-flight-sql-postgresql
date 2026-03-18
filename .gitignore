@@ -35,3 +35,9 @@
 .bundle
 .DS_Store
 /substrait_test/explain/
+/substrait_test/monitor_*.csv
+/substrait_test/*/data/sf010/
+/substrait_test/*/data/sf100/
+/substrait_test/*/data/sf500/
+/substrait_test/*/data/sf1000/
+/scripts/
