@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 import pyarrow.flight as flight
 
@@ -23,10 +24,13 @@ FLIGHT_URI = "grpc://127.0.0.1:15432"
 PSQL_CMD = ["psql", "-h", "127.0.0.1", "-U", "martin", "-d", "postgres",
             "-v", "ON_ERROR_STOP=1"]
 
-# CLI: --sf 0.1, --suite tpch/tpcds, --query 16
+# CLI: --sf 0.1, --suite tpch/tpcds, --query 16, --benchmark, --csv, --explain
 SCALE_FACTOR = os.environ.get("SCALE_FACTOR", "1")
 FILTER_SUITE = None   # None = all
 FILTER_QUERY = None   # None = all
+BENCHMARK = False
+CSV_OUTPUT = False
+EXPLAIN_MODE = False
 for i, a in enumerate(sys.argv[1:], 1):
     if a == "--sf" and i < len(sys.argv) - 1:
         SCALE_FACTOR = sys.argv[i + 1]
@@ -34,6 +38,14 @@ for i, a in enumerate(sys.argv[1:], 1):
         FILTER_SUITE = sys.argv[i + 1]
     elif a == "--query" and i < len(sys.argv) - 1:
         FILTER_QUERY = int(sys.argv[i + 1])
+    elif a == "--benchmark":
+        BENCHMARK = True
+    elif a == "--csv":
+        CSV_OUTPUT = True
+    elif a == "--explain":
+        EXPLAIN_MODE = True
+
+AFS_EXPLAIN_DIR = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
 
 TPCH_DATA_DIR = os.environ.get(
     "TPCH_DATA_DIR", f"/tmp/tpch_sf{SCALE_FACTOR}")
@@ -184,6 +196,37 @@ def flight_exec_substrait(plan_bytes):
 
 
 # ============================================================
+# EXPLAIN capture
+# ============================================================
+
+EXPLAIN_DIR = os.path.join(SCRIPT_DIR, "explain")
+
+
+def save_explain_pg(query_name, sql):
+    """Run EXPLAIN ANALYZE via psql and save output."""
+    explain_sql = f"EXPLAIN ANALYZE {sql}"
+    cmd = PSQL_CMD + ["-c", explain_sql]
+    r = subprocess.run(cmd, capture_output=True, timeout=60)
+    if r.returncode != 0:
+        return
+    path = os.path.join(EXPLAIN_DIR, f"{query_name}_pg.txt")
+    with open(path, "w") as f:
+        f.write(r.stdout.decode())
+
+
+def save_explain_substrait(query_name):
+    """Read adapter's EXPLAIN ANALYZE output from AFS_EXPLAIN_DIR/latest.txt."""
+    src = os.path.join(AFS_EXPLAIN_DIR, "latest.txt")
+    if not os.path.exists(src):
+        return
+    dst = os.path.join(EXPLAIN_DIR, f"{query_name}_substrait.txt")
+    with open(src) as f:
+        content = f.read()
+    with open(dst, "w") as f:
+        f.write(content)
+
+
+# ============================================================
 # Result comparison
 # ============================================================
 
@@ -292,6 +335,7 @@ def cleanup_tpch():
 # ============================================================
 
 _results = {"pass": 0, "fail": 0, "skip": 0}
+_timings = []  # list of (query_name, pg_time_s, substrait_time_s)
 
 
 def _wait_for_pg(max_wait=30):
@@ -344,8 +388,21 @@ def run_tpch_test(qnr):
     if query_sql.endswith(";"):
         query_sql = query_sql[:-1]
 
+    t0 = time.monotonic()
     expected = psql_csv(query_sql)
+    pg_time = time.monotonic() - t0
+
+    t0 = time.monotonic()
     actual = table_to_rows(flight_exec_substrait(plan))
+    substrait_time = time.monotonic() - t0
+
+    if EXPLAIN_MODE:
+        name = f"tpch_q{qnr:02d}"
+        save_explain_pg(name, query_sql)
+        save_explain_substrait(name)
+
+    if BENCHMARK:
+        _timings.append((f"TPC-H Q{qnr:02d}", pg_time, substrait_time))
 
     has_sort = "order by" in query_sql.lower()
     ok, diff = rows_equal(expected, actual, ordered=has_sort)
@@ -442,8 +499,21 @@ def run_tpcds_test(qnr):
     if query_sql.endswith(";"):
         query_sql = query_sql[:-1]
 
+    t0 = time.monotonic()
     expected = psql_csv(query_sql)
+    pg_time = time.monotonic() - t0
+
+    t0 = time.monotonic()
     actual = table_to_rows(flight_exec_substrait(plan))
+    substrait_time = time.monotonic() - t0
+
+    if EXPLAIN_MODE:
+        name = f"tpcds_q{qnr:02d}"
+        save_explain_pg(name, query_sql)
+        save_explain_substrait(name)
+
+    if BENCHMARK:
+        _timings.append((f"TPC-DS Q{qnr:02d}", pg_time, substrait_time))
 
     has_sort = "order by" in query_sql.lower()
     ok, diff = rows_equal(expected, actual, ordered=has_sort)
@@ -477,15 +547,47 @@ def tpcds_tests():
 # Main
 # ============================================================
 
+def print_benchmark():
+    if not _timings:
+        return
+    if CSV_OUTPUT:
+        print("query,pg_time_s,substrait_time_s,ratio,status")
+        for name, pg_t, sub_t in _timings:
+            ratio = sub_t / pg_t if pg_t > 0 else float('inf')
+            status = "regressed" if ratio > 2.0 else "ok"
+            print(f"{name},{pg_t:.4f},{sub_t:.4f},{ratio:.2f},{status}")
+        return
+
+    print("\nBenchmark Results")
+    print("=" * 70)
+    print(f"{'query':<16} {'pg_time_s':>10} {'substrait_time_s':>16} {'ratio':>8} {'status':>10}")
+    print("-" * 70)
+    for name, pg_t, sub_t in _timings:
+        ratio = sub_t / pg_t if pg_t > 0 else float('inf')
+        status = "REGRESSED" if ratio > 2.0 else "ok"
+        print(f"{name:<16} {pg_t:>10.4f} {sub_t:>16.4f} {ratio:>8.2f} {status:>10}")
+    print("-" * 70)
+    regressed = sum(1 for _, pg_t, sub_t in _timings
+                    if pg_t > 0 and sub_t / pg_t > 2.0)
+    print(f"{len(_timings)} queries, {regressed} regressed (>2x)")
+
+
 def main():
     print(f"Substrait integration tests (SF{SCALE_FACTOR})")
     print("=" * 40)
     print(f"Implemented: {sorted(IMPLEMENTED)}")
 
+    if EXPLAIN_MODE:
+        os.makedirs(EXPLAIN_DIR, exist_ok=True)
+        print(f"EXPLAIN output -> {EXPLAIN_DIR}")
+
     if FILTER_SUITE in (None, "tpch"):
         tpch_tests()
     if FILTER_SUITE in (None, "tpcds"):
         tpcds_tests()
+
+    if BENCHMARK:
+        print_benchmark()
 
     if FILTER_SUITE in (None, "tpch"):
         cleanup_tpch()

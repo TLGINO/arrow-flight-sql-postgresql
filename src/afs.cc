@@ -20,6 +20,9 @@ extern "C"
 #include <postgres.h>
 
 #include <access/xact.h>
+#include <commands/explain.h>
+#include <commands/explain_format.h>
+#include <commands/explain_state.h>
 #include <executor/executor.h>
 #include <executor/spi.h>
 #include <fmgr.h>
@@ -71,6 +74,7 @@ extern "C"
 #include <arrow/ipc/writer.h>
 #include <arrow/table_builder.h>
 #include <arrow/util/base64.h>
+#include <arrow/util/decimal.h>
 #include <arrow/util/string.h>
 
 #include <cinttypes>
@@ -83,6 +87,7 @@ extern "C"
 #include <type_traits>
 
 #include <arpa/inet.h>
+#include <sys/stat.h>
 
 #ifdef __GNUC__
 #	define AFS_FUNC __PRETTY_FUNCTION__
@@ -128,6 +133,10 @@ static int SessionTimeout;
 
 static const int MaxNRowsPerRecordBatchDefault = 1 * 1024 * 1024;
 static int MaxNRowsPerRecordBatch;
+
+// AFS_EXPLAIN=analyze: log EXPLAIN ANALYZE for each Substrait query
+static bool AfsExplainAnalyze = false;
+static const char* AfsExplainDir = "/tmp/afs_explain";
 
 static volatile sig_atomic_t GotSIGTERM = false;
 void
@@ -1069,24 +1078,14 @@ class ArrowArrayBuilderBase {
 
 	virtual ~ArrowArrayBuilderBase() = default;
 
-	arrow::Status build(uint64_t iTuple, uint64_t iTupleEnd)
-	{
-		if (attribute_->attnotnull)
-		{
-			return build_not_null(iTuple, iTupleEnd);
-		}
-		else
-		{
-			return build_may_null(iTuple, iTupleEnd);
-		}
-	}
-
    protected:
 	Form_pg_attribute attribute_;
 	int iAttribute_;
 
-	virtual arrow::Status build_not_null(uint64_t iTuple, uint64_t iTupleEnd) = 0;
-	virtual arrow::Status build_may_null(uint64_t iTuple, uint64_t iTupleEnd) = 0;
+   public:
+	// Append a single value directly from a deformed TupleTableSlot.
+	// Caller must call slot_getallattrs() before invoking this.
+	virtual arrow::Status append_from_slot(TupleTableSlot* slot) = 0;
 };
 
 template <typename ArrowType, typename Enable = void>
@@ -1100,9 +1099,7 @@ class ArrowArrayBuilder<ArrowType, arrow::enable_if_has_c_type<ArrowType>>
 	                  int iAttribute,
 	                  arrow::ArrayBuilder* builder)
 		: ArrowArrayBuilderBase(attribute, iAttribute),
-		  builder_(static_cast<BuilderType*>(builder)),
-		  values_(),
-		  validBytes_()
+		  builder_(static_cast<BuilderType*>(builder))
 	{
 	}
 
@@ -1111,58 +1108,15 @@ class ArrowArrayBuilder<ArrowType, arrow::enable_if_has_c_type<ArrowType>>
 	using BuilderType = typename arrow::TypeTraits<ArrowType>::BuilderType;
 
 	BuilderType* builder_;
-	std::vector<CType> values_;
-	std::vector<uint8_t> validBytes_;
 
-	arrow::Status build_not_null(uint64_t iTuple, uint64_t iTupleEnd)
+	arrow::Status append_from_slot(TupleTableSlot* slot) override
 	{
-		uint64_t n = iTupleEnd - iTuple;
-		values_.resize(n);
-		for (uint64_t i = 0; i < n; ++i)
-		{
-			bool isNull;
-			auto datum = SPI_getbinval(SPI_tuptable->vals[iTuple + i],
-			                           SPI_tuptable->tupdesc,
-			                           iAttribute_ + 1,
-			                           &isNull);
-			values_[i] = convert_value<ArrowType>(datum);
-		}
-		return builder_->AppendValues(values_.data(), values_.size());
-	}
-
-	arrow::Status build_may_null(uint64_t iTuple, uint64_t iTupleEnd)
-	{
-		bool haveNull = false;
-		uint64_t n = iTupleEnd - iTuple;
-		values_.resize(n);
-		validBytes_.resize(n);
-		for (uint64_t i = 0; i < n; ++i)
-		{
-			bool isNull;
-			auto datum = SPI_getbinval(SPI_tuptable->vals[iTuple + i],
-			                           SPI_tuptable->tupdesc,
-			                           iAttribute_ + 1,
-			                           &isNull);
-			if (isNull)
-			{
-				haveNull = true;
-				validBytes_[i] = 0;
-			}
-			else
-			{
-				validBytes_[i] = 1;
-				values_[i] = convert_value<ArrowType>(datum);
-			}
-		}
-		if (haveNull)
-		{
-			return builder_->AppendValues(
-				values_.data(), values_.size(), validBytes_.data());
-		}
+		Datum datum = slot->tts_values[iAttribute_];
+		bool isNull = slot->tts_isnull[iAttribute_];
+		if (attribute_->attnotnull || !isNull)
+			return builder_->Append(convert_value<ArrowType>(datum));
 		else
-		{
-			return builder_->AppendValues(values_.data(), values_.size());
-		}
+			return builder_->AppendNull();
 	}
 
 	template <typename TargetArrowType>
@@ -1229,9 +1183,7 @@ class ArrowArrayBuilder<ArrowType, arrow::enable_if_base_binary<ArrowType>>
 	                  int iAttribute,
 	                  arrow::ArrayBuilder* builder)
 		: ArrowArrayBuilderBase(attribute, iAttribute),
-		  builder_(static_cast<BuilderType*>(builder)),
-		  values_(),
-		  validBytes_()
+		  builder_(static_cast<BuilderType*>(builder))
 	{
 	}
 
@@ -1239,109 +1191,63 @@ class ArrowArrayBuilder<ArrowType, arrow::enable_if_base_binary<ArrowType>>
 	using BuilderType = typename arrow::TypeTraits<ArrowType>::BuilderType;
 
 	BuilderType* builder_;
-	std::vector<std::string> values_;
-	std::vector<uint8_t> validBytes_;
 
-	arrow::Status build_not_null(uint64_t iTuple, uint64_t iTupleEnd)
+	arrow::Status append_from_slot(TupleTableSlot* slot) override
 	{
-		uint64_t n = iTupleEnd - iTuple;
-		values_.resize(n);
-		for (uint64_t i = 0; i < n; ++i)
-		{
-			bool isNull;
-			auto datum = SPI_getbinval(SPI_tuptable->vals[iTuple + i],
-			                           SPI_tuptable->tupdesc,
-			                           iAttribute_ + 1,
-			                           &isNull);
-			values_[i] = std::string(VARDATA_ANY(datum), VARSIZE_ANY_EXHDR(datum));
-		}
-		return builder_->AppendValues(values_);
-	}
-
-	arrow::Status build_may_null(uint64_t iTuple, uint64_t iTupleEnd)
-	{
-		bool haveNull = false;
-		uint64_t n = iTupleEnd - iTuple;
-		values_.resize(n);
-		validBytes_.resize(n);
-		for (uint64_t i = 0; i < n; ++i)
-		{
-			bool isNull;
-			auto datum = SPI_getbinval(SPI_tuptable->vals[iTuple + i],
-			                           SPI_tuptable->tupdesc,
-			                           iAttribute_ + 1,
-			                           &isNull);
-			if (isNull)
-			{
-				haveNull = true;
-				validBytes_[i] = 0;
-			}
-			else
-			{
-				validBytes_[i] = 1;
-				values_[i] = std::string(VARDATA_ANY(datum), VARSIZE_ANY_EXHDR(datum));
-			}
-		}
-		if (haveNull)
-		{
-			return builder_->AppendValues(values_, validBytes_.data());
-		}
+		Datum datum = slot->tts_values[iAttribute_];
+		bool isNull = slot->tts_isnull[iAttribute_];
+		if (attribute_->attnotnull || !isNull)
+			return builder_->Append(
+				static_cast<const char*>(VARDATA_ANY(datum)),
+				static_cast<int32_t>(VARSIZE_ANY_EXHDR(datum)));
 		else
-		{
-			return builder_->AppendValues(values_);
-		}
+			return builder_->AppendNull();
 	}
 };
 
-/* NUMERIC → float64 builder.  PG's NUMERIC is variable-precision so we
- * convert via the built-in numeric_float8 cast (lossy but practical). */
-class NumericToDoubleBuilder : public ArrowArrayBuilderBase {
+/* NUMERIC → Arrow Decimal128 builder.  Converts PG NUMERIC to native
+ * Arrow Decimal128 for exact precision (no float64 lossy conversion). */
+class NumericToDecimal128Builder : public ArrowArrayBuilderBase {
    public:
-	NumericToDoubleBuilder(Form_pg_attribute attribute,
-	                       int iAttribute,
-	                       arrow::ArrayBuilder* builder)
+	NumericToDecimal128Builder(Form_pg_attribute attribute,
+	                           int iAttribute,
+	                           arrow::ArrayBuilder* builder)
 		: ArrowArrayBuilderBase(attribute, iAttribute),
-		  builder_(static_cast<arrow::DoubleBuilder*>(builder))
+		  builder_(static_cast<arrow::Decimal128Builder*>(builder)),
+		  target_scale_(
+			  std::static_pointer_cast<arrow::Decimal128Type>(builder->type())
+				  ->scale())
 	{
 	}
 
    private:
-	arrow::DoubleBuilder* builder_;
+	arrow::Decimal128Builder* builder_;
+	int32_t target_scale_;
 
-	static double numeric_to_double(Datum datum)
+	arrow::Status append_from_slot(TupleTableSlot* slot) override
 	{
-		return DatumGetFloat8(DirectFunctionCall1(numeric_float8, datum));
-	}
-
-	arrow::Status build_not_null(uint64_t iTuple, uint64_t iTupleEnd) override
-	{
-		for (uint64_t i = iTuple; i < iTupleEnd; ++i)
+		Datum datum = slot->tts_values[iAttribute_];
+		bool isNull = slot->tts_isnull[iAttribute_];
+		if (attribute_->attnotnull || !isNull)
 		{
-			bool isNull;
-			auto datum = SPI_getbinval(SPI_tuptable->vals[i],
-			                           SPI_tuptable->tupdesc,
-			                           iAttribute_ + 1,
-			                           &isNull);
-			ARROW_RETURN_NOT_OK(builder_->Append(numeric_to_double(datum)));
+			char* str =
+				DatumGetCString(DirectFunctionCall1(numeric_out, datum));
+			arrow::Decimal128 val;
+			int32_t precision, scale;
+			ARROW_RETURN_NOT_OK(
+				arrow::Decimal128::FromString(str, &val, &precision, &scale));
+			if (scale != target_scale_)
+			{
+				auto rescaled = val.Rescale(scale, target_scale_);
+				if (!rescaled.ok())
+					return rescaled.status();
+				val = std::move(rescaled).ValueUnsafe();
+			}
+			pfree(str);
+			return builder_->Append(val);
 		}
-		return arrow::Status::OK();
-	}
-
-	arrow::Status build_may_null(uint64_t iTuple, uint64_t iTupleEnd) override
-	{
-		for (uint64_t i = iTuple; i < iTupleEnd; ++i)
-		{
-			bool isNull;
-			auto datum = SPI_getbinval(SPI_tuptable->vals[i],
-			                           SPI_tuptable->tupdesc,
-			                           iAttribute_ + 1,
-			                           &isNull);
-			if (isNull)
-				ARROW_RETURN_NOT_OK(builder_->AppendNull());
-			else
-				ARROW_RETURN_NOT_OK(builder_->Append(numeric_to_double(datum)));
-		}
-		return arrow::Status::OK();
+		else
+			return builder_->AppendNull();
 	}
 };
 
@@ -1368,7 +1274,7 @@ ArrowArrayBuilderBase::make(Form_pg_attribute attribute,
 			return std::make_unique<ArrowArrayBuilder<arrow::DoubleType>>(
 				attribute, iAttribute, builder);
 		case NUMERICOID:
-			return std::make_unique<NumericToDoubleBuilder>(
+			return std::make_unique<NumericToDecimal128Builder>(
 				attribute, iAttribute, builder);
 		case VARCHAROID:
 		case TEXTOID:
@@ -1404,8 +1310,20 @@ ArrowArrayBuilderBase::arrow_type(Form_pg_attribute attribute)
 		case FLOAT4OID:
 			return arrow::float32();
 		case FLOAT8OID:
-		case NUMERICOID:
 			return arrow::float64();
+		case NUMERICOID:
+		{
+			int32_t typmod = attribute->atttypmod;
+			if (typmod >= VARHDRSZ)
+			{
+				int32_t precision =
+					((typmod - VARHDRSZ) >> 16) & 0xFFFF;
+				int32_t scale = (typmod - VARHDRSZ) & 0xFFFF;
+				return arrow::decimal128(precision, scale);
+			}
+			/* Bare NUMERIC without precision/scale (e.g. aggregate results) */
+			return arrow::decimal128(38, 10);
+		}
 		case VARCHAROID:
 		case TEXTOID:
 		case BPCHAROID:
@@ -2098,9 +2016,47 @@ class Executor : public WorkerProcessor {
 			SetCurrentStatementStartTimestamp();
 
 			Query* query = substrait_to_query(planData, planSize);
+
+			// Set planner GUCs to help PG optimize Substrait-generated
+			// query trees (especially flat FROM-lists from US-003).
+			set_config_option("join_collapse_limit", "20",
+				PGC_USERSET, PGC_S_SESSION,
+				GUC_ACTION_LOCAL, true, ERROR, false);
+			set_config_option("from_collapse_limit", "20",
+				PGC_USERSET, PGC_S_SESSION,
+				GUC_ACTION_LOCAL, true, ERROR, false);
+			set_config_option("geqo_threshold", "20",
+				PGC_USERSET, PGC_S_SESSION,
+				GUC_ACTION_LOCAL, true, ERROR, false);
+
 			PlannedStmt* pstmt = standard_planner(query, "<substrait>", 0, NULL);
 
 			PushActiveSnapshot(GetTransactionSnapshot());
+
+			if (AfsExplainAnalyze)
+			{
+				ExplainState* es = NewExplainState();
+				es->analyze = true;
+				es->costs = true;
+				es->buffers = true;
+				es->timing = true;
+				es->summary = true;
+				es->format = EXPLAIN_FORMAT_TEXT;
+
+				ExplainBeginOutput(es);
+				ExplainOnePlan(pstmt, NULL, es, "<substrait>",
+				               NULL, NULL, NULL, NULL, NULL);
+				ExplainEndOutput(es);
+
+				mkdir(AfsExplainDir, 0755);
+				std::string path = std::string(AfsExplainDir) + "/latest.txt";
+				std::ofstream out(path);
+				if (out)
+					out << es->str->data;
+
+				pfree(es->str->data);
+				pfree(es);
+			}
 			QueryDesc* qdesc = CreateQueryDesc(pstmt,
 			                                   "<substrait>",
 			                                   GetActiveSnapshot(),
@@ -2112,35 +2068,11 @@ class Executor : public WorkerProcessor {
 			ExecutorStart(qdesc, EXEC_FLAG_SKIP_TRIGGERS);
 
 			TupleDesc tupdesc = qdesc->tupDesc;
-			std::vector<HeapTuple> tuples;
-			for (;;)
-			{
-				TupleTableSlot* slot = ExecProcNode(qdesc->planstate);
-				if (TupIsNull(slot))
-					break;
-				tuples.push_back(ExecCopySlotHeapTuple(slot));
-			}
-
-			// Temporarily set SPI globals so write_record_batches() can
-			// read tuples via SPI_tuptable / SPI_processed.
-			SPITupleTable fakeTupleTable;
-			memset(&fakeTupleTable, 0, sizeof(fakeTupleTable));
-			fakeTupleTable.tupdesc = tupdesc;
-			fakeTupleTable.vals = tuples.data();
-
-			auto savedTupleTable = SPI_tuptable;
-			auto savedProcessed = SPI_processed;
-			SPI_tuptable = &fakeTupleTable;
-			SPI_processed = tuples.size();
 
 			pgstat_report_activity(
 				STATE_RUNNING,
 				(std::string(Tag) + ": " + tag + ": writing").c_str());
-			auto status = write_record_batches(tag);
-
-			SPI_tuptable = savedTupleTable;
-			SPI_processed = savedProcessed;
-
+			auto status = write_record_batches_streaming(tag, tupdesc, qdesc);
 			if (!status.ok())
 			{
 				set_error_message(
@@ -2149,9 +2081,6 @@ class Executor : public WorkerProcessor {
 						": failed to write: " + status.ToString(),
 					tag);
 			}
-
-			for (auto& tuple : tuples)
-				pfree(tuple);
 
 			ExecutorFinish(qdesc);
 			ExecutorEnd(qdesc);
@@ -2173,10 +2102,13 @@ class Executor : public WorkerProcessor {
 	arrow::Status write_record_batches(const char* tag)
 	{
 		SharedRingBufferOutputStream output(this, localSession_);
+		TupleDesc tupdesc = SPI_tuptable->tupdesc;
+		int natts = tupdesc->natts;
+
 		std::vector<std::shared_ptr<arrow::Field>> fields;
-		for (int i = 0; i < SPI_tuptable->tupdesc->natts; ++i)
+		for (int i = 0; i < natts; ++i)
 		{
-			auto attribute = TupleDescAttr(SPI_tuptable->tupdesc, i);
+			auto attribute = TupleDescAttr(tupdesc, i);
 			ARROW_ASSIGN_OR_RAISE(auto type,
 			                      ArrowArrayBuilderBase::arrow_type(attribute));
 			fields.push_back(arrow::field(
@@ -2187,9 +2119,9 @@ class Executor : public WorkerProcessor {
 			auto builder,
 			arrow::RecordBatchBuilder::Make(schema, arrow::default_memory_pool()));
 		std::vector<std::unique_ptr<ArrowArrayBuilderBase>> builders;
-		for (int i = 0; i < SPI_tuptable->tupdesc->natts; ++i)
+		for (int i = 0; i < natts; ++i)
 		{
-			auto attribute = TupleDescAttr(SPI_tuptable->tupdesc, i);
+			auto attribute = TupleDescAttr(tupdesc, i);
 			ARROW_ASSIGN_OR_RAISE(
 				auto array_builder,
 				ArrowArrayBuilderBase::make(attribute, i, builder->GetField(i)));
@@ -2202,85 +2134,143 @@ class Executor : public WorkerProcessor {
 		// Write schema only stream format data to return only schema.
 		ARROW_ASSIGN_OR_RAISE(auto writer,
 		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
-		// Build an empty record batch to write schema.
 		ARROW_ASSIGN_OR_RAISE(auto recordBatch, builder->Flush());
 		P("%s: %s: %s: write: schema: WriteRecordBatch", Tag, tag_, tag);
 		ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
 		P("%s: %s: %s: write: schema: Close", Tag, tag_, tag);
 		ARROW_RETURN_NOT_OK(writer->Close());
 
-		// Write another stream format data with record batches.
+		// Store SPI tuples into a TupleTableSlot and use append_from_slot
+		// to read values directly via slot_getattr instead of SPI_getbinval.
 		ARROW_ASSIGN_OR_RAISE(writer,
 		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
-		uint64_t iTuple = 0;
-		for (; iTuple < SPI_processed; iTuple += MaxNRowsPerRecordBatch)
+		TupleTableSlot* slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+		uint64_t nRowsInBatch = 0;
+		uint64_t totalRows = 0;
+
+		for (uint64_t iTuple = 0; iTuple < SPI_processed; ++iTuple)
 		{
-			uint64_t iTupleEnd = iTuple + MaxNRowsPerRecordBatch;
-			if (iTupleEnd >= SPI_processed)
+			ExecStoreHeapTuple(SPI_tuptable->vals[iTuple], slot, false);
+			slot_getallattrs(slot);
+			for (int i = 0; i < natts; ++i)
 			{
-				iTupleEnd = SPI_processed;
+				ARROW_RETURN_NOT_OK(builders[i]->append_from_slot(slot));
 			}
-			P("%s: %s: %s: write: data: record batch: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  iTupleEnd);
-			for (int iAttribute = 0; iAttribute < SPI_tuptable->tupdesc->natts;
-			     ++iAttribute)
+			nRowsInBatch++;
+
+			if (nRowsInBatch >= static_cast<uint64_t>(MaxNRowsPerRecordBatch))
 			{
-				P("%s: %s: %s: write: data: record batch: %" PRIu64 "/%" PRIu64 ": %d/%d",
-				  Tag,
-				  tag_,
-				  tag,
-				  iTuple,
-				  iTupleEnd,
-				  iAttribute,
-				  SPI_tuptable->tupdesc->natts);
-				ARROW_RETURN_NOT_OK(builders[iAttribute]->build(iTuple, iTupleEnd));
+				ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
+				P("%s: %s: %s: write: data: WriteRecordBatch: %" PRIu64 "/%" PRIu64,
+				  Tag, tag_, tag, totalRows, totalRows + nRowsInBatch);
+				ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+				totalRows += nRowsInBatch;
+				nRowsInBatch = 0;
 			}
+		}
+
+		if (nRowsInBatch > 0)
+		{
 			ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
-			P("%s: %s: %s: write: data: WriteRecordBatch: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  iTupleEnd);
+			P("%s: %s: %s: write: data: WriteRecordBatch: last: %" PRIu64 "/%" PRIu64,
+			  Tag, tag_, tag, totalRows, totalRows + nRowsInBatch);
 			ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
 		}
 
-		if (iTuple < SPI_processed)
+		ExecDropSingleTupleTableSlot(slot);
+		P("%s: %s: %s, write: data: Close", Tag, tag_, tag);
+		ARROW_RETURN_NOT_OK(writer->Close());
+		return output.Close();
+	}
+
+	// Streaming variant: builds Arrow batches directly from ExecProcNode
+	// output without materializing all tuples first.
+	arrow::Status write_record_batches_streaming(
+		const char* tag, TupleDesc tupdesc, QueryDesc* qdesc)
+	{
+		SharedRingBufferOutputStream output(this, localSession_);
+		int natts = tupdesc->natts;
+
+		// Build schema
+		std::vector<std::shared_ptr<arrow::Field>> fields;
+		for (int i = 0; i < natts; ++i)
 		{
-			P("%s: %s: %s: write: data: record batch: last: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  SPI_processed);
-			for (int iAttribute = 0; iAttribute < SPI_tuptable->tupdesc->natts;
-			     ++iAttribute)
+			auto attribute = TupleDescAttr(tupdesc, i);
+			ARROW_ASSIGN_OR_RAISE(auto type,
+			                      ArrowArrayBuilderBase::arrow_type(attribute));
+			fields.push_back(arrow::field(
+				NameStr(attribute->attname), std::move(type),
+				!attribute->attnotnull));
+		}
+		auto schema = arrow::schema(fields);
+
+		ARROW_ASSIGN_OR_RAISE(
+			auto builder,
+			arrow::RecordBatchBuilder::Make(schema, arrow::default_memory_pool()));
+
+		// Create per-column builders
+		std::vector<std::unique_ptr<ArrowArrayBuilderBase>> builders;
+		for (int i = 0; i < natts; ++i)
+		{
+			auto attribute = TupleDescAttr(tupdesc, i);
+			ARROW_ASSIGN_OR_RAISE(
+				auto array_builder,
+				ArrowArrayBuilderBase::make(attribute, i, builder->GetField(i)));
+			builders.push_back(std::move(array_builder));
+		}
+
+		auto options = arrow::ipc::IpcWriteOptions::Defaults();
+		options.emit_dictionary_deltas = true;
+
+		// Write schema-only first batch (ring buffer protocol)
+		ARROW_ASSIGN_OR_RAISE(auto writer,
+		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
+		ARROW_ASSIGN_OR_RAISE(auto recordBatch, builder->Flush());
+		P("%s: %s: %s: write: schema: WriteRecordBatch", Tag, tag_, tag);
+		ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+		P("%s: %s: %s: write: schema: Close", Tag, tag_, tag);
+		ARROW_RETURN_NOT_OK(writer->Close());
+
+		// Stream data batches directly from executor
+		ARROW_ASSIGN_OR_RAISE(writer,
+		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
+		uint64_t nRowsInBatch = 0;
+		uint64_t totalRows = 0;
+
+		for (;;)
+		{
+			TupleTableSlot* slot = ExecProcNode(qdesc->planstate);
+			if (TupIsNull(slot))
+				break;
+
+			slot_getallattrs(slot);
+			for (int i = 0; i < natts; ++i)
 			{
-				P("%s: %s: %s: write: data: record batch: last: %" PRIu64 "/%" PRIu64
-				  ": %d/%d",
-				  Tag,
-				  tag_,
-				  tag,
-				  iTuple,
-				  SPI_processed,
-				  iAttribute,
-				  SPI_tuptable->tupdesc->natts);
-				ARROW_RETURN_NOT_OK(builders[iAttribute]->build(iTuple, SPI_processed));
+				ARROW_RETURN_NOT_OK(builders[i]->append_from_slot(slot));
 			}
+			nRowsInBatch++;
+
+			if (nRowsInBatch >= static_cast<uint64_t>(MaxNRowsPerRecordBatch))
+			{
+				ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
+				P("%s: %s: %s: write: data: WriteRecordBatch: %" PRIu64 "/%" PRIu64,
+				  Tag, tag_, tag, totalRows, totalRows + nRowsInBatch);
+				ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+				totalRows += nRowsInBatch;
+				nRowsInBatch = 0;
+			}
+		}
+
+		// Flush remaining rows
+		if (nRowsInBatch > 0)
+		{
 			ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
 			P("%s: %s: %s: write: data: WriteRecordBatch: last: %" PRIu64 "/%" PRIu64,
-			  Tag,
-			  tag_,
-			  tag,
-			  iTuple,
-			  SPI_processed);
+			  Tag, tag_, tag, totalRows, totalRows + nRowsInBatch);
 			ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
 		}
-		P("%s: %s: %s, write: data: Close", Tag, tag_, tag);
+
+		P("%s: %s: %s: write: data: Close", Tag, tag_, tag);
 		ARROW_RETURN_NOT_OK(writer->Close());
 		return output.Close();
 	}
@@ -4646,6 +4636,16 @@ afs_executor(Datum arg)
 	pqsignal(SIGSEGV, afs_sigsegv);
 #endif
 	BackgroundWorkerUnblockSignals();
+
+	// Check AFS_EXPLAIN env var
+	{
+		const char* explain = getenv("AFS_EXPLAIN");
+		if (explain && strcmp(explain, "analyze") == 0)
+			AfsExplainAnalyze = true;
+		const char* dir = getenv("AFS_EXPLAIN_DIR");
+		if (dir)
+			AfsExplainDir = dir;
+	}
 
 	auto executor = new Executor(DatumGetInt64(arg));
 	before_shmem_exit(afs_executor_before_shmem_exit, PointerGetDatum(executor));

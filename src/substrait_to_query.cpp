@@ -290,10 +290,18 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
 
 /* Build a from-list Node for a base relation tree.
  * Adds RTEs to rtable. Returns a single Node* for Read/Join;
- * for Cross, adds children to fromlist directly and returns NULL. */
+ * for Cross (and flattened INNER Join), adds children to fromlist
+ * directly and returns NULL.
+ * flatten_inner: when true, INNER JoinRel is flattened like CrossRel
+ * (conditions moved to WHERE). Set false when parent needs a non-NULL
+ * node (e.g. larg/rarg of a non-INNER JoinExpr).
+ * virtuals_out: if non-null, receives computed column expressions from
+ * inlined ProjectRel (key = field index in schema_out). */
 static Node *
 build_from_node(const substrait::Rel &rel, Query *query,
-                SubstraitSchema &schema_out, const FuncMap &func_map)
+                SubstraitSchema &schema_out, const FuncMap &func_map,
+                bool flatten_inner = true,
+                VirtualMap *virtuals_out = nullptr)
 {
     if (rel.has_read())
     {
@@ -313,21 +321,90 @@ build_from_node(const substrait::Rel &rel, Query *query,
     else if (rel.has_cross())
     {
         const auto &cross = rel.cross();
-        Node *l = build_from_node(cross.left(), query, schema_out, func_map);
+        VirtualMap left_virt, right_virt;
+        int left_base = (int)schema_out.size();
+        Node *l = build_from_node(cross.left(), query, schema_out, func_map,
+                                  true, &left_virt);
         if (l)
             query->jointree->fromlist = lappend(query->jointree->fromlist, l);
-        Node *r = build_from_node(cross.right(), query, schema_out, func_map);
+        int left_count = (int)schema_out.size() - left_base;
+        Node *r = build_from_node(cross.right(), query, schema_out, func_map,
+                                  true, &right_virt);
         if (r)
             query->jointree->fromlist = lappend(query->jointree->fromlist, r);
+
+        /* Merge virtual maps: right side offset by left column count. */
+        if (virtuals_out)
+        {
+            *virtuals_out = left_virt;
+            for (auto &[idx, expr] : right_virt)
+                (*virtuals_out)[idx + left_count] = expr;
+        }
         return NULL;
     }
     else if (rel.has_join())
     {
         const auto &jn = rel.join();
-        SubstraitSchema left_schema, right_schema;
 
-        Node *larg = build_from_node(jn.left(), query, left_schema, func_map);
-        Node *rarg = build_from_node(jn.right(), query, right_schema, func_map);
+        /* Flatten INNER JoinRel like CrossRel: add children to fromlist,
+         * move join condition to WHERE clause. Only when caller can handle
+         * NULL return (top-level, CrossRel parent, or another flattened
+         * INNER parent). */
+        if (flatten_inner &&
+            jn.type() == substrait::JoinRel::JOIN_TYPE_INNER)
+        {
+            SubstraitSchema left_schema, right_schema;
+            VirtualMap left_virt, right_virt;
+            Node *l = build_from_node(jn.left(), query, left_schema, func_map,
+                                      true, &left_virt);
+            if (l)
+                query->jointree->fromlist =
+                    lappend(query->jointree->fromlist, l);
+            Node *r = build_from_node(jn.right(), query, right_schema,
+                                      func_map, true, &right_virt);
+            if (r)
+                query->jointree->fromlist =
+                    lappend(query->jointree->fromlist, r);
+
+            schema_out = left_schema;
+            schema_out.insert(schema_out.end(), right_schema.begin(),
+                              right_schema.end());
+
+            /* Merge virtual maps: right side offset by left column count. */
+            VirtualMap combined_virt = left_virt;
+            int left_count = (int)left_schema.size();
+            for (auto &[idx, expr] : right_virt)
+                combined_virt[idx + left_count] = expr;
+
+            /* Move join condition to WHERE clause. */
+            if (jn.has_expression())
+            {
+                Node *cond = (Node *)convert_expression(
+                    jn.expression(), schema_out, func_map, combined_virt);
+                if (query->jointree->quals == NULL)
+                    query->jointree->quals = cond;
+                else
+                    query->jointree->quals = (Node *)makeBoolExpr(
+                        AND_EXPR,
+                        list_make2(query->jointree->quals, cond), -1);
+            }
+
+            if (virtuals_out)
+                *virtuals_out = combined_virt;
+
+            return NULL;
+        }
+
+        /* Non-INNER joins (LEFT/RIGHT/FULL) or non-flattenable INNER:
+         * build explicit JoinExpr. Children called with flatten_inner=false
+         * since JoinExpr requires non-NULL larg/rarg. */
+        SubstraitSchema left_schema, right_schema;
+        VirtualMap left_virt, right_virt;
+
+        Node *larg = build_from_node(jn.left(), query, left_schema, func_map,
+                                     false, &left_virt);
+        Node *rarg = build_from_node(jn.right(), query, right_schema, func_map,
+                                     false, &right_virt);
 
         /* Combined schema for join condition resolution. */
         SubstraitSchema combined = left_schema;
@@ -351,20 +428,33 @@ build_from_node(const substrait::Rel &rel, Query *query,
                                 jn.type())));
         }
 
+        /* Merge virtual maps for join condition resolution. */
+        VirtualMap combined_virt = left_virt;
+        int left_count = (int)left_schema.size();
+        for (auto &[idx, expr] : right_virt)
+            combined_virt[idx + left_count] = expr;
+
         Node *quals = NULL;
         if (jn.has_expression())
             quals = (Node *)convert_expression(jn.expression(),
-                                               combined, func_map);
+                                               combined, func_map,
+                                               combined_virt);
 
         /* RTE_JOIN entry for the planner. */
         List *alias_vars = NIL;
         List *col_names = NIL;
-        for (auto &[rt, attnum, typeoid] : combined)
+        for (int ci = 0; ci < (int)combined.size(); ci++)
         {
+            auto &[rt, attnum, typeoid] = combined[ci];
             Oid collation = is_string_type(typeoid)
                 ? DEFAULT_COLLATION_OID : InvalidOid;
-            alias_vars = lappend(alias_vars,
-                makeVar(rt, attnum, typeoid, -1, collation, 0));
+            auto vit = combined_virt.find(ci);
+            if (vit != combined_virt.end())
+                alias_vars = lappend(alias_vars,
+                    copyObjectImpl(vit->second));
+            else
+                alias_vars = lappend(alias_vars,
+                    makeVar(rt, attnum, typeoid, -1, collation, 0));
             col_names = lappend(col_names,
                 makeString(pstrdup("?column?")));
         }
@@ -398,6 +488,93 @@ build_from_node(const substrait::Rel &rel, Query *query,
 
         schema_out = combined;
         return (Node *)jexpr;
+    }
+
+    /* --- FilterRel: peel filter, recurse on input, add condition to WHERE.
+     * Avoids subquery barrier for filtered base tables inside joins. --- */
+    if (rel.has_filter())
+    {
+        const auto &filt = rel.filter();
+        Node *node = build_from_node(filt.input(), query, schema_out,
+                                     func_map, flatten_inner, virtuals_out);
+        if (filt.has_condition())
+        {
+            VirtualMap vmap;
+            if (virtuals_out)
+                vmap = *virtuals_out;
+            Node *cond = (Node *)convert_expression(
+                filt.condition(), schema_out, func_map, vmap);
+            if (query->jointree->quals == NULL)
+                query->jointree->quals = cond;
+            else
+                query->jointree->quals = (Node *)makeBoolExpr(
+                    AND_EXPR,
+                    list_make2(query->jointree->quals, cond), -1);
+        }
+        return node;
+    }
+
+    /* --- ProjectRel: peel projection, recurse on input, apply emit mapping.
+     * Inlines column selection/reordering and computed columns.
+     * Computed columns stored in virtuals_out for join condition resolution. --- */
+    if (rel.has_project())
+    {
+        const auto &proj = rel.project();
+        SubstraitSchema input_schema;
+        VirtualMap input_virtuals;
+        Node *node = build_from_node(proj.input(), query, input_schema,
+                                     func_map, flatten_inner, &input_virtuals);
+
+        /* Convert expressions (computed columns). */
+        std::vector<Expr *> raw_virtuals;
+        for (int i = 0; i < proj.expressions_size(); i++)
+        {
+            raw_virtuals.push_back(convert_expression(
+                proj.expressions(i), input_schema, func_map, input_virtuals));
+        }
+
+        int n_input = (int)input_schema.size();
+
+        if (proj.has_common() && proj.common().has_emit())
+        {
+            const auto &mapping = proj.common().emit().output_mapping();
+            schema_out.clear();
+            VirtualMap new_virtuals;
+            for (int i = 0; i < mapping.size(); i++)
+            {
+                int src = mapping.Get(i);
+                if (src < n_input)
+                {
+                    schema_out.push_back(input_schema[src]);
+                    auto vit = input_virtuals.find(src);
+                    if (vit != input_virtuals.end())
+                        new_virtuals[i] = vit->second;
+                }
+                else
+                {
+                    Expr *ve = raw_virtuals[src - n_input];
+                    schema_out.push_back({0, 0, exprType((Node *)ve)});
+                    new_virtuals[i] = ve;
+                }
+            }
+            if (virtuals_out)
+                *virtuals_out = new_virtuals;
+        }
+        else
+        {
+            schema_out = input_schema;
+            VirtualMap new_virtuals = input_virtuals;
+            for (size_t i = 0; i < raw_virtuals.size(); i++)
+            {
+                Expr *ve = raw_virtuals[i];
+                schema_out.push_back({0, 0, exprType((Node *)ve)});
+                new_virtuals[n_input + (int)i] = ve;
+            }
+            if (virtuals_out)
+                *virtuals_out = new_virtuals;
+        }
+
+        return node;
     }
 
     /* Non-base rel (e.g. Aggregate inside a Cross) — wrap as subquery. */
@@ -438,9 +615,11 @@ build_from_node(const substrait::Rel &rel, Query *query,
 /* Top-level: process base relation tree into query->jointree->fromlist. */
 static void
 process_base_rel(const substrait::Rel &rel, Query *query,
-                 SubstraitSchema &schema_out, const FuncMap &func_map)
+                 SubstraitSchema &schema_out, const FuncMap &func_map,
+                 VirtualMap *virtuals_out = nullptr)
 {
-    Node *node = build_from_node(rel, query, schema_out, func_map);
+    Node *node = build_from_node(rel, query, schema_out, func_map,
+                                 true, virtuals_out);
     if (node)
         query->jointree->fromlist = lappend(query->jointree->fromlist, node);
 }
@@ -1942,18 +2121,21 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
 
     if (is_base)
     {
-        process_base_rel(*cur, query, schema, func_map);
+        VirtualMap base_virtuals;
+        process_base_rel(*cur, query, schema, func_map, &base_virtuals);
 
         /* Apply filter */
         if (filter_rel != nullptr)
         {
             query->jointree->quals = (Node *)convert_expression(
-                filter_rel->condition(), schema, func_map, {}, outer_schema);
+                filter_rel->condition(), schema, func_map,
+                base_virtuals, outer_schema);
         }
         else if (cur->has_read() && cur->read().has_filter())
         {
             query->jointree->quals = (Node *)convert_expression(
-                cur->read().filter(), schema, func_map, {}, outer_schema);
+                cur->read().filter(), schema, func_map,
+                base_virtuals, outer_schema);
         }
 
         /* Apply ReadRel projection */
@@ -1983,7 +2165,7 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
             {
                 raw_virtuals.push_back(convert_expression(
                     inner_project_rel->expressions(i),
-                    projected_schema, func_map));
+                    projected_schema, func_map, base_virtuals));
             }
 
             int n_input = (int)projected_schema.size();
@@ -2001,6 +2183,10 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                     if (src < n_input)
                     {
                         new_schema.push_back(projected_schema[src]);
+                        /* Propagate base virtuals through emit. */
+                        auto bvit = base_virtuals.find(src);
+                        if (bvit != base_virtuals.end())
+                            virtual_map[i] = bvit->second;
                     }
                     else
                     {
@@ -2013,6 +2199,9 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
             }
             else
             {
+                /* Propagate base virtuals into virtual_map. */
+                for (auto &[bvi, bve] : base_virtuals)
+                    virtual_map[bvi] = bve;
                 for (size_t i = 0; i < raw_virtuals.size(); i++)
                 {
                     Expr *ve = raw_virtuals[i];
@@ -2020,6 +2209,11 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                     virtual_map[n_input + (int)i] = ve;
                 }
             }
+        }
+        else if (!base_virtuals.empty())
+        {
+            /* No inner project, but base rel inlined virtuals. */
+            virtual_map = base_virtuals;
         }
     }
     else
@@ -2139,21 +2333,34 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
     }
     else if (!schema.empty())
     {
-        /* No aggregate — build tlist from full schema (all tables). */
+        /* No aggregate — build tlist from full schema (all tables).
+         * Virtual columns (from inlined ProjectRel) use expressions
+         * from virtual_map instead of Var nodes. */
         List *tlist = NIL;
         AttrNumber resno = 1;
-        for (auto &[rt, attnum, typeoid] : schema)
+        for (int si = 0; si < (int)schema.size(); si++)
         {
-            Oid collation = is_string_type(typeoid)
-                ? DEFAULT_COLLATION_OID : InvalidOid;
-            Var *var = makeVar(rt, attnum, typeoid, -1, collation, 0);
-            RangeTblEntry *rte =
-                (RangeTblEntry *)list_nth(query->rtable, rt - 1);
-            char *colname = (rte->rtekind == RTE_RELATION)
-                ? get_attname(rte->relid, attnum, false)
-                : pstrdup("?column?");
-            TargetEntry *tle = makeTargetEntry(
-                (Expr *)var, resno++, colname, false);
+            auto &[rt, attnum, typeoid] = schema[si];
+            Expr *expr;
+            char *colname;
+            auto vit = virtual_map.find(si);
+            if (vit != virtual_map.end())
+            {
+                expr = (Expr *)copyObjectImpl(vit->second);
+                colname = pstrdup("expr");
+            }
+            else
+            {
+                Oid collation = is_string_type(typeoid)
+                    ? DEFAULT_COLLATION_OID : InvalidOid;
+                expr = (Expr *)makeVar(rt, attnum, typeoid, -1, collation, 0);
+                RangeTblEntry *rte =
+                    (RangeTblEntry *)list_nth(query->rtable, rt - 1);
+                colname = (rte->rtekind == RTE_RELATION)
+                    ? get_attname(rte->relid, attnum, false)
+                    : pstrdup("?column?");
+            }
+            TargetEntry *tle = makeTargetEntry(expr, resno++, colname, false);
             tlist = lappend(tlist, tle);
         }
         query->targetList = tlist;

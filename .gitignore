@@ -34,3 +34,4 @@
 
 .bundle
 .DS_Store
+/substrait_test/explain/
