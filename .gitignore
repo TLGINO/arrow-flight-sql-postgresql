@@ -41,3 +41,5 @@
 /substrait_test/*/data/sf500/
 /substrait_test/*/data/sf1000/
 /scripts/
+__pycache__/
+.claude/

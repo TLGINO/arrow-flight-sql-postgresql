@@ -3276,6 +3276,13 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
     if (is_set && agg_rel != nullptr)
         is_set = false;
 
+    /* SET under PROJECT with expressions must also be wrapped —
+     * window funcs / emit can create resjunk TLEs that PG's
+     * postprocess_setop_tlist cannot handle on setop queries. */
+    if (is_set && project_rel != nullptr &&
+        project_rel->expressions_size() > 0)
+        is_set = false;
+
     if (is_set)
     {
         /* UNION ALL / UNION DISTINCT — build as PG SetOperationStmt. */

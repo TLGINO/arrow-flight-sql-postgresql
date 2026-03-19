@@ -105,7 +105,7 @@ TPCDS_TABLES = [
     "web_returns", "web_sales", "catalog_sales", "store_sales",
 ]
 
-TPCDS_SKIP = {27, 36, 70, 86}  # GROUPING — no Isthmus plans
+TPCDS_SKIP = set()  # previously skipped GROUPING queries (27,36,70,86)
 
 STORE_SALES_ROWS = {"0.01": 28810, "0.1": 288464, "1": 2880404}
 
@@ -201,13 +201,15 @@ def psql_csv(sql, search_path=None):
     r = subprocess.run(cmd, input=sql.encode(), capture_output=True)
     if r.returncode != 0:
         raise RuntimeError(f"psql error:\n{r.stderr.decode()}")
-    text = r.stdout.decode().strip()
-    if not text:
+    raw = r.stdout.decode()
+    if not raw:
         return []
+    # Strip exactly one trailing newline (psql always appends one);
+    # preserve blank lines — they represent all-NULL rows.
+    if raw.endswith('\n'):
+        raw = raw[:-1]
     rows = []
-    for line in text.split("\n"):
-        if not line:
-            continue
+    for line in raw.split("\n"):
         rows.append(tuple(parse_csv_value(v) for v in line.split(sep)))
     return rows
 

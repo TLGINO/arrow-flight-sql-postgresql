@@ -162,8 +162,8 @@ static volatile sig_atomic_t GotSIGUSR1 = false;
 void
 afs_sigusr1(SIGNAL_ARGS)
 {
-	procsignal_sigusr1_handler(postgres_signal_arg);
 	auto errnoSaved = errno;
+	procsignal_sigusr1_handler(postgres_signal_arg);
 	GotSIGUSR1 = true;
 	SetLatch(MyLatch);
 	errno = errnoSaved;
@@ -609,6 +609,10 @@ shared_session_data_finalize(SharedSessionData* session, dsa_area* area)
 		dsa_free(area, session->prepareQuery);
 	if (DsaPointerIsValid(session->preparedStatementHandle))
 		dsa_free(area, session->preparedStatementHandle);
+	if (DsaPointerIsValid(session->clientAddress))
+		dsa_free(area, session->clientAddress);
+	if (DsaPointerIsValid(session->substraitPlan))
+		dsa_free(area, session->substraitPlan);
 	SharedRingBuffer::free_data(&(session->bufferData), area);
 }
 
@@ -839,7 +843,7 @@ class WorkerProcessor : public Processor {
 		LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 		bool found;
 		sharedData_ = static_cast<SharedData*>(
-			ShmemInitStruct(SharedDataName, sizeof(sharedData_), &found));
+			ShmemInitStruct(SharedDataName, sizeof(SharedData), &found));
 		if (!found)
 		{
 			LWLockRelease(AddinShmemInitLock);
@@ -1234,8 +1238,10 @@ class NumericToDecimal128Builder : public ArrowArrayBuilderBase {
 				DatumGetCString(DirectFunctionCall1(numeric_out, datum));
 			arrow::Decimal128 val;
 			int32_t precision, scale;
-			ARROW_RETURN_NOT_OK(
-				arrow::Decimal128::FromString(str, &val, &precision, &scale));
+			auto parse_status =
+				arrow::Decimal128::FromString(str, &val, &precision, &scale);
+			pfree(str);
+			ARROW_RETURN_NOT_OK(parse_status);
 			if (scale != target_scale_)
 			{
 				if (scale > target_scale_)
@@ -1261,7 +1267,6 @@ class NumericToDecimal128Builder : public ArrowArrayBuilderBase {
 					val = std::move(rescaled).ValueUnsafe();
 				}
 			}
-			pfree(str);
 			return builder_->Append(val);
 		}
 		else
@@ -1372,7 +1377,7 @@ class PreparedStatement {
 	{
 		if (parameters_.empty())
 		{
-			auto result = SPI_execute(query_.c_str(), false, 0);
+			auto result = SPI_execute(query_.c_str(), true, 0);
 			if (result <= 0)
 			{
 				return arrow::Status::Invalid("failed to run a query: ",
@@ -2016,13 +2021,14 @@ class Executor : public WorkerProcessor {
 			return;
 		}
 
-		const uint8_t* planData;
+		std::vector<uint8_t> planCopy;
 		size_t planSize;
 		{
 			ProcessorLockGuard lock(this);
-			planData = static_cast<const uint8_t*>(
+			const uint8_t* planData = static_cast<const uint8_t*>(
 				dsa_get_address(area_, session->substraitPlan));
 			planSize = session->substraitPlanSize;
+			planCopy.assign(planData, planData + planSize);
 		}
 
 		P("%s: %s: %s: plan size: %" PRIsize, Tag, tag_, tag, planSize);
@@ -2034,7 +2040,18 @@ class Executor : public WorkerProcessor {
 
 			SetCurrentStatementStartTimestamp();
 
-			Query* query = substrait_to_query(planData, planSize);
+#ifdef AFS_DEBUG
+			struct timespec ts0, ts1, ts2;
+			clock_gettime(CLOCK_MONOTONIC, &ts0);
+#endif
+
+			Query* query = substrait_to_query(planCopy.data(), planSize);
+
+#ifdef AFS_DEBUG
+			clock_gettime(CLOCK_MONOTONIC, &ts1);
+			elog(LOG, "AFS_DEBUG %s: substrait_to_query %.3f ms",
+				tag, (ts1.tv_sec - ts0.tv_sec) * 1e3 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6);
+#endif
 
 			// Set planner GUCs to help PG optimize Substrait-generated
 			// query trees (especially flat FROM-lists from US-003).
@@ -2048,41 +2065,17 @@ class Executor : public WorkerProcessor {
 				PGC_USERSET, PGC_S_SESSION,
 				GUC_ACTION_LOCAL, true, ERROR, false);
 
-			/* Debug: dump query tree before planning */
-			{
-				char *tree = nodeToString(query);
-				std::ofstream dbg("/tmp/q5tree_current.txt");
-				if (dbg) dbg << tree;
-				pfree(tree);
-				elog(LOG, "AFS Q5DBG: hasGroupRTE=%d hasAggs=%d rtable=%d groupClause=%d groupingSets=%d",
-					query->hasGroupRTE, query->hasAggs,
-					list_length(query->rtable),
-					list_length(query->groupClause),
-					list_length(query->groupingSets));
-			}
+			PlannedStmt* pstmt = standard_planner(query, "<substrait>", 0, NULL);
 
-			PlannedStmt* pstmt;
-			PG_TRY();
-			{
-				pstmt = standard_planner(query, "<substrait>", 0, NULL);
-			}
-			PG_CATCH();
-			{
-				ErrorData *edata = CopyErrorData();
-				elog(LOG, "AFS Q5DBG FAIL: %s (detail: %s, file: %s:%d func: %s)",
-					edata->message ? edata->message : "(null)",
-					edata->detail ? edata->detail : "(null)",
-					edata->filename ? edata->filename : "?",
-					edata->lineno,
-					edata->funcname ? edata->funcname : "?");
-				FreeErrorData(edata);
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
+#ifdef AFS_DEBUG
+			clock_gettime(CLOCK_MONOTONIC, &ts2);
+			elog(LOG, "AFS_DEBUG %s: standard_planner %.3f ms",
+				tag, (ts2.tv_sec - ts1.tv_sec) * 1e3 + (ts2.tv_nsec - ts1.tv_nsec) / 1e6);
+#endif
 
 			PushActiveSnapshot(GetTransactionSnapshot());
 
-			if (AfsExplainAnalyze)
+		if (AfsExplainAnalyze)
 			{
 				ExplainState* es = NewExplainState();
 				es->analyze = true;
@@ -2121,7 +2114,7 @@ class Executor : public WorkerProcessor {
 			pgstat_report_activity(
 				STATE_RUNNING,
 				(std::string(Tag) + ": " + tag + ": writing").c_str());
-			auto status = write_record_batches_streaming(tag, tupdesc, qdesc);
+		auto status = write_record_batches_streaming(tag, tupdesc, qdesc);
 			if (!status.ok())
 			{
 				set_error_message(
@@ -2130,6 +2123,15 @@ class Executor : public WorkerProcessor {
 						": failed to write: " + status.ToString(),
 					tag);
 			}
+
+#ifdef AFS_DEBUG
+			{
+				struct timespec ts3;
+				clock_gettime(CLOCK_MONOTONIC, &ts3);
+				elog(LOG, "AFS_DEBUG %s: execution %.3f ms",
+					tag, (ts3.tv_sec - ts2.tv_sec) * 1e3 + (ts3.tv_nsec - ts2.tv_nsec) / 1e6);
+			}
+#endif
 
 			ExecutorFinish(qdesc);
 			ExecutorEnd(qdesc);
@@ -4200,7 +4202,7 @@ class MainProcessor : public Processor {
 		LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 		bool found;
 		sharedData_ = static_cast<SharedData*>(
-			ShmemInitStruct(SharedDataName, sizeof(sharedData_), &found));
+			ShmemInitStruct(SharedDataName, sizeof(SharedData), &found));
 		if (found)
 		{
 			LWLockRelease(AddinShmemInitLock);
