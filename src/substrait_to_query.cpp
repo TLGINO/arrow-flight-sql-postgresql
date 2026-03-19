@@ -15,10 +15,12 @@
 /* --- Step 1: C++ standard library (no conflicts) --- */
 #include <algorithm>
 #include <cstdarg>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /* --- Step 2: Protobuf / Substrait headers (must be before postgres.h) --- */
@@ -208,6 +210,8 @@ typedef std::unordered_map<int, Expr *> VirtualMap;
  * so PG materializes once instead of re-executing N times.
  * (Fixes Calcite CTE inlining, e.g. TPC-DS Q4.)
  * ============================================================ */
+using FpHash = uint64_t;
+
 struct RelCache {
     struct CteEntry {
         CommonTableExpr *cte;
@@ -218,53 +222,129 @@ struct RelCache {
     };
     std::unordered_map<std::string, CteEntry> built;
     std::unordered_set<std::string> duplicates;
+    /* O(N) hash-based dedup caches */
+    std::unordered_map<const substrait::Rel*, FpHash> hash_cache;
+    std::unordered_set<FpHash> dup_hashes;
+    std::unordered_map<const substrait::Rel*, std::string> fp_cache;
     List *cte_list = NIL;
     int next_id = 0;
 };
 
-/* Deterministic fingerprint of a Rel subtree. */
-static std::string
-fingerprint_rel(const substrait::Rel &rel)
+/* --- O(N) hash-based fingerprinting for CTE dedup --- */
+
+static FpHash
+hash_combine(FpHash h1, FpHash h2)
 {
-    return rel.SerializeAsString();
+    return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
 }
 
-/* Walk Rel tree, count how many times each subtree fingerprint appears. */
-static void
-count_rel_subtrees(const substrait::Rel &rel,
-                   std::unordered_map<std::string, int> &counts)
+static std::vector<const substrait::Rel*>
+get_rel_children(const substrait::Rel &rel)
 {
-    std::string fp = fingerprint_rel(rel);
-    counts[fp]++;
-
-    /* Unary rels — recurse into input. */
-    if (rel.has_fetch())
-        count_rel_subtrees(rel.fetch().input(), counts);
-    if (rel.has_sort())
-        count_rel_subtrees(rel.sort().input(), counts);
-    if (rel.has_project())
-        count_rel_subtrees(rel.project().input(), counts);
-    if (rel.has_aggregate())
-        count_rel_subtrees(rel.aggregate().input(), counts);
-    if (rel.has_filter())
-        count_rel_subtrees(rel.filter().input(), counts);
-    /* Binary/N-ary rels. */
+    std::vector<const substrait::Rel*> out;
+    if (rel.has_fetch())    out.push_back(&rel.fetch().input());
+    if (rel.has_sort())     out.push_back(&rel.sort().input());
+    if (rel.has_project())  out.push_back(&rel.project().input());
+    if (rel.has_aggregate()) out.push_back(&rel.aggregate().input());
+    if (rel.has_filter())   out.push_back(&rel.filter().input());
     if (rel.has_cross())
     {
-        count_rel_subtrees(rel.cross().left(), counts);
-        count_rel_subtrees(rel.cross().right(), counts);
+        out.push_back(&rel.cross().left());
+        out.push_back(&rel.cross().right());
     }
     if (rel.has_join())
     {
-        count_rel_subtrees(rel.join().left(), counts);
-        count_rel_subtrees(rel.join().right(), counts);
+        out.push_back(&rel.join().left());
+        out.push_back(&rel.join().right());
     }
     if (rel.has_set())
     {
         for (int i = 0; i < rel.set().inputs_size(); i++)
-            count_rel_subtrees(rel.set().inputs(i), counts);
+            out.push_back(&rel.set().inputs(i));
     }
-    /* ReadRel is a leaf — nothing to recurse into. */
+    return out;
+}
+
+/* Fast structural hash (O(N) over the tree). */
+static FpHash
+fingerprint_rel_hash(const substrait::Rel &rel,
+                     std::unordered_map<const substrait::Rel*, FpHash> &cache)
+{
+    auto it = cache.find(&rel);
+    if (it != cache.end()) return it->second;
+    FpHash h = std::hash<int>{}(rel.rel_type_case());
+    h = hash_combine(h, std::hash<size_t>{}(rel.ByteSizeLong()));
+    for (auto *child : get_rel_children(rel))
+        h = hash_combine(h, fingerprint_rel_hash(*child, cache));
+    cache[&rel] = h;
+    return h;
+}
+
+/* Exact fingerprint (serialization), cached per Rel pointer. */
+static const std::string &
+fingerprint_rel(const substrait::Rel &rel, RelCache &rc)
+{
+    auto it = rc.fp_cache.find(&rel);
+    if (it != rc.fp_cache.end()) return it->second;
+    auto &s = rc.fp_cache[&rel];
+    s = rel.SerializeAsString();
+    return s;
+}
+
+/* Two-phase dedup: O(N) hash pass, then exact serialization only on collisions. */
+static void
+count_rel_subtrees(const substrait::Rel &rel, RelCache &rel_cache)
+{
+    /* Phase 1: collect all nodes and compute hashes. */
+    std::vector<const substrait::Rel*> all_nodes;
+    std::function<void(const substrait::Rel &)> collect =
+        [&](const substrait::Rel &r)
+    {
+        all_nodes.push_back(&r);
+        for (auto *child : get_rel_children(r))
+            collect(*child);
+    };
+    collect(rel);
+
+    /* Count hashes. */
+    std::unordered_map<FpHash, int> hash_counts;
+    for (auto *node : all_nodes)
+    {
+        FpHash h = fingerprint_rel_hash(*node, rel_cache.hash_cache);
+        hash_counts[h]++;
+    }
+
+    /* Record which hashes appear >=2 times. */
+    for (auto &[h, cnt] : hash_counts)
+    {
+        if (cnt >= 2)
+            rel_cache.dup_hashes.insert(h);
+    }
+
+    /* Phase 2: exact serialization only for candidate duplicates. */
+    std::unordered_map<std::string, int> exact_counts;
+    for (auto *node : all_nodes)
+    {
+        FpHash h = rel_cache.hash_cache[node];
+        if (!rel_cache.dup_hashes.count(h))
+            continue;
+        const std::string &fp = fingerprint_rel(*node, rel_cache);
+        exact_counts[fp]++;
+    }
+
+    for (auto &[fp, cnt] : exact_counts)
+    {
+        if (cnt >= 2 && fp.size() > 256)
+        {
+            /* Skip dedup for CrossRel/JoinRel: materializing them as CTEs
+             * creates unfiltered Cartesian products (e.g. TPC-DS Q88). */
+            substrait::Rel tmp;
+            tmp.ParseFromString(fp);
+            if (tmp.has_cross() || tmp.has_join())
+                continue;
+            rel_cache.duplicates.insert(fp);
+        }
+    }
 }
 
 /* Build a simple SELECT * FROM cte_name query for a CTE reference. */
@@ -472,8 +552,11 @@ read_rel_to_rte(const substrait::ReadRel &read,
                 }
             }
             if (!found)
+            {
+                RelationClose(rel);
                 throw SubstraitError(sfmt("substrait: column \"%s\" not found in \"%s\"",
                                           col.c_str(), names[0].c_str()));
+            }
         }
     }
     else
@@ -740,6 +823,8 @@ build_from_node(const substrait::Rel &rel, Query *query,
     foreach(lc, subq->targetList)
     {
         TargetEntry *tle = (TargetEntry *)lfirst(lc);
+        if (tle->resjunk)
+            continue;
         colnames = lappend(colnames,
             makeString(pstrdup(tle->resname ? tle->resname : "?column?")));
         Oid t = exprType((Node *)tle->expr);
@@ -786,6 +871,338 @@ static const std::unordered_map<std::string, std::string> kAggNameMap = {
     {"variance", "var_samp"},
     {"bool_and", "bool_and"},
     {"bool_or", "bool_or"},
+};
+
+/* Pure window functions (not aggregates). Maps Substrait name → PG name. */
+static const std::unordered_map<std::string, std::string> kWinFuncNameMap = {
+    {"rank", "rank"},
+    {"dense_rank", "dense_rank"},
+    {"row_number", "row_number"},
+    {"ntile", "ntile"},
+    {"lag", "lag"},
+    {"lead", "lead"},
+    {"first_value", "first_value"},
+    {"last_value", "last_value"},
+    {"nth_value", "nth_value"},
+    {"percent_rank", "percent_rank"},
+    {"cume_dist", "cume_dist"},
+};
+
+/* -------- Window function deferred-spec infrastructure --------
+ *
+ * convert_expression returns a WindowFunc* node but cannot create the
+ * WindowClause (it has no access to Query*).  We stash the partition /
+ * sort / frame info per WindowFunc* in a file-static map.  After the
+ * target list is built, fixup_window_clauses() groups identical specs
+ * into WindowClause entries and sets winref on every WindowFunc.
+ *
+ * Safe because PG backends are single-threaded.
+ */
+
+struct PendingWinSpec
+{
+    List       *partition_exprs;   /* List of Expr* */
+    List       *sort_exprs;        /* List of Expr* (sort keys) */
+    List       *sort_dirs;         /* List of int   (SortField::Direction) */
+    int         frame_options;
+    Node       *start_offset;
+    Node       *end_offset;
+};
+
+static std::unordered_map<WindowFunc *, PendingWinSpec> g_pending_wins;
+
+/*
+ * Map Substrait WindowFunction bounds to PG frameOptions.
+ */
+static int
+substrait_bounds_to_frame(
+    const substrait::Expression_WindowFunction &wf,
+    Node **start_offset, Node **end_offset)
+{
+    using Bound = substrait::Expression_WindowFunction_Bound;
+    int opts = FRAMEOPTION_NONDEFAULT | FRAMEOPTION_BETWEEN;
+    *start_offset = NULL;
+    *end_offset = NULL;
+
+    /* ROWS vs RANGE (default RANGE). */
+    if (wf.bounds_type() == substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS)
+        opts |= FRAMEOPTION_ROWS;
+    else
+        opts |= FRAMEOPTION_RANGE;
+
+    /* Lower bound */
+    if (wf.has_lower_bound())
+    {
+        const auto &lb = wf.lower_bound();
+        if (lb.has_unbounded())
+            opts |= FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+        else if (lb.has_current_row())
+            opts |= FRAMEOPTION_START_CURRENT_ROW;
+        else if (lb.has_preceding())
+        {
+            opts |= FRAMEOPTION_START_OFFSET_PRECEDING;
+            *start_offset = (Node *)makeConst(
+                INT8OID, -1, InvalidOid, sizeof(int64),
+                Int64GetDatum(lb.preceding().offset()), false, true);
+        }
+        else if (lb.has_following())
+        {
+            opts |= FRAMEOPTION_START_OFFSET_FOLLOWING;
+            *start_offset = (Node *)makeConst(
+                INT8OID, -1, InvalidOid, sizeof(int64),
+                Int64GetDatum(lb.following().offset()), false, true);
+        }
+    }
+    else
+        opts |= FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+
+    /* Upper bound */
+    if (wf.has_upper_bound())
+    {
+        const auto &ub = wf.upper_bound();
+        if (ub.has_unbounded())
+            opts |= FRAMEOPTION_END_UNBOUNDED_FOLLOWING;
+        else if (ub.has_current_row())
+            opts |= FRAMEOPTION_END_CURRENT_ROW;
+        else if (ub.has_preceding())
+        {
+            opts |= FRAMEOPTION_END_OFFSET_PRECEDING;
+            *end_offset = (Node *)makeConst(
+                INT8OID, -1, InvalidOid, sizeof(int64),
+                Int64GetDatum(ub.preceding().offset()), false, true);
+        }
+        else if (ub.has_following())
+        {
+            opts |= FRAMEOPTION_END_OFFSET_FOLLOWING;
+            *end_offset = (Node *)makeConst(
+                INT8OID, -1, InvalidOid, sizeof(int64),
+                Int64GetDatum(ub.following().offset()), false, true);
+        }
+    }
+    else
+        opts |= FRAMEOPTION_END_CURRENT_ROW;
+
+    return opts;
+}
+
+/*
+ * Walk expression tree collecting all WindowFunc nodes.
+ */
+static bool
+collect_window_funcs_walker(Node *node, List **wfuncs)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, WindowFunc))
+    {
+        *wfuncs = lappend(*wfuncs, node);
+        /* still recurse into args */
+    }
+    if (IsA(node, Query))
+        return false; /* don't descend into sub-Queries */
+    return expression_tree_walker(node,
+        (bool (*)()) collect_window_funcs_walker, wfuncs);
+}
+
+/*
+ * After building the target list, create WindowClause entries for all
+ * WindowFunc nodes found in the tlist, grouping identical specs.
+ */
+static void
+fixup_window_clauses(Query *query)
+{
+    /* Collect all WindowFunc nodes from the target list. */
+    List *wfuncs = NIL;
+    ListCell *lc;
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *)lfirst(lc);
+        collect_window_funcs_walker((Node *)tle->expr, &wfuncs);
+    }
+
+    if (wfuncs == NIL)
+        return;
+
+    query->hasWindowFuncs = true;
+
+    /* Group into WindowClauses.  Simple O(n^2) — n is tiny. */
+    Index next_winref = 1;
+    Index next_sgref = 0;
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *)lfirst(lc);
+        if (tle->ressortgroupref > next_sgref)
+            next_sgref = tle->ressortgroupref;
+    }
+    next_sgref++;
+
+    ListCell *wlc;
+    foreach(wlc, wfuncs)
+    {
+        WindowFunc *wf = (WindowFunc *)lfirst(wlc);
+        if (wf->winref != 0)
+            continue;   /* already assigned */
+
+        auto it = g_pending_wins.find(wf);
+        if (it == g_pending_wins.end())
+            continue;
+        PendingWinSpec &spec = it->second;
+
+        /* Build partition clause (SortGroupClause list).
+         * Each partition expression needs a tlist entry with ressortgroupref. */
+        List *partition_clause = NIL;
+        ListCell *plc;
+        foreach(plc, spec.partition_exprs)
+        {
+            Expr *pexpr = (Expr *)lfirst(plc);
+
+            /* Find or add matching tlist entry. */
+            TargetEntry *match = NULL;
+            ListCell *tlc;
+            foreach(tlc, query->targetList)
+            {
+                TargetEntry *tle = (TargetEntry *)lfirst(tlc);
+                if (equal(tle->expr, pexpr))
+                {
+                    match = tle;
+                    break;
+                }
+            }
+            if (match == NULL)
+            {
+                match = makeTargetEntry(
+                    (Expr *)copyObjectImpl(pexpr),
+                    (AttrNumber)(list_length(query->targetList) + 1),
+                    pstrdup("partition_col"),
+                    true);   /* resjunk */
+                query->targetList = lappend(query->targetList, match);
+            }
+            if (match->ressortgroupref == 0)
+                match->ressortgroupref = next_sgref++;
+
+            Oid coltype = exprType((Node *)pexpr);
+            Oid ltOpr, eqOpr;
+            bool isHashable;
+            get_sort_group_operators(coltype, true, true, false,
+                                     &ltOpr, &eqOpr, NULL, &isHashable);
+
+            SortGroupClause *sgc = makeNode(SortGroupClause);
+            sgc->tleSortGroupRef = match->ressortgroupref;
+            sgc->eqop = eqOpr;
+            sgc->sortop = ltOpr;
+            sgc->nulls_first = false;
+            sgc->hashable = isHashable;
+            partition_clause = lappend(partition_clause, sgc);
+        }
+
+        /* Build order clause. */
+        List *order_clause = NIL;
+        if (spec.sort_exprs != NIL)
+        {
+            int si = 0;
+            ListCell *slc, *dlc;
+            forboth(slc, spec.sort_exprs, dlc, spec.sort_dirs)
+            {
+                Expr *sexpr = (Expr *)lfirst(slc);
+                int dir = lfirst_int(dlc);
+
+                TargetEntry *match = NULL;
+                ListCell *tlc;
+                foreach(tlc, query->targetList)
+                {
+                    TargetEntry *tle = (TargetEntry *)lfirst(tlc);
+                    if (equal(tle->expr, sexpr))
+                    {
+                        match = tle;
+                        break;
+                    }
+                }
+                if (match == NULL)
+                {
+                    match = makeTargetEntry(
+                        (Expr *)copyObjectImpl(sexpr),
+                        (AttrNumber)(list_length(query->targetList) + 1),
+                        pstrdup("sort_col"),
+                        true);
+                    query->targetList = lappend(query->targetList, match);
+                }
+                if (match->ressortgroupref == 0)
+                    match->ressortgroupref = next_sgref++;
+
+                bool is_desc =
+                    (dir == substrait::SortField::SORT_DIRECTION_DESC_NULLS_FIRST ||
+                     dir == substrait::SortField::SORT_DIRECTION_DESC_NULLS_LAST);
+                bool nulls_first =
+                    (dir == substrait::SortField::SORT_DIRECTION_ASC_NULLS_FIRST ||
+                     dir == substrait::SortField::SORT_DIRECTION_DESC_NULLS_FIRST);
+
+                Oid coltype = exprType((Node *)sexpr);
+                Oid ltOpr, eqOpr, gtOpr;
+                bool isHashable;
+                get_sort_group_operators(coltype, !is_desc, true, is_desc,
+                                         &ltOpr, &eqOpr, &gtOpr, &isHashable);
+
+                SortGroupClause *sgc = makeNode(SortGroupClause);
+                sgc->tleSortGroupRef = match->ressortgroupref;
+                sgc->eqop = eqOpr;
+                sgc->sortop = is_desc ? gtOpr : ltOpr;
+                sgc->reverse_sort = is_desc;
+                sgc->nulls_first = nulls_first;
+                sgc->hashable = isHashable;
+                order_clause = lappend(order_clause, sgc);
+                si++;
+            }
+        }
+
+        /* Create WindowClause. */
+        WindowClause *wc = makeNode(WindowClause);
+        wc->name = NULL;
+        wc->refname = NULL;
+        wc->partitionClause = partition_clause;
+        wc->orderClause = order_clause;
+        wc->frameOptions = spec.frame_options;
+        wc->startOffset = spec.start_offset;
+        wc->endOffset = spec.end_offset;
+        wc->startInRangeFunc = InvalidOid;
+        wc->endInRangeFunc = InvalidOid;
+        wc->inRangeColl = InvalidOid;
+        wc->inRangeAsc = true;
+        wc->inRangeNullsFirst = false;
+        wc->winref = next_winref;
+        wc->copiedOrder = false;
+
+        query->windowClause = lappend(query->windowClause, wc);
+        wf->winref = next_winref;
+
+        /* Assign same winref to other WindowFuncs with identical spec. */
+        ListCell *wlc2;
+        foreach(wlc2, wfuncs)
+        {
+            WindowFunc *wf2 = (WindowFunc *)lfirst(wlc2);
+            if (wf2 == wf || wf2->winref != 0)
+                continue;
+            auto it2 = g_pending_wins.find(wf2);
+            if (it2 == g_pending_wins.end())
+                continue;
+            PendingWinSpec &s2 = it2->second;
+            if (equal(s2.partition_exprs, spec.partition_exprs) &&
+                equal(s2.sort_exprs, spec.sort_exprs) &&
+                s2.frame_options == spec.frame_options &&
+                equal(s2.start_offset, spec.start_offset) &&
+                equal(s2.end_offset, spec.end_offset))
+            {
+                wf2->winref = next_winref;
+            }
+        }
+        next_winref++;
+    }
+
+    /* Cleanup. */
+    foreach(wlc, wfuncs)
+    {
+        WindowFunc *wf = (WindowFunc *)lfirst(wlc);
+        g_pending_wins.erase(wf);
+    }
 };
 
 /*
@@ -1441,7 +1858,7 @@ convert_expression(const substrait::Expression &expr,
         {
             const auto &ids = lit.interval_day_to_second();
             Interval *iv = (Interval *)palloc(sizeof(Interval));
-            iv->time = (int64)ids.seconds() * 1000000;
+            iv->time = (int64)ids.seconds() * 1000000 + ids.microseconds();
             iv->day = ids.days();
             iv->month = 0;
             return (Expr *)makeConst(INTERVALOID, -1, InvalidOid,
@@ -1606,7 +2023,23 @@ convert_expression(const substrait::Expression &expr,
                     typmod_func = ((Form_pg_cast)GETSTRUCT(tp))->castfunc;
                     ReleaseSysCache(tp);
                 }
-                (void)typmod_func; /* typmod applied at execution */
+                if (OidIsValid(typmod_func))
+                {
+                    FuncExpr *tfe = makeNode(FuncExpr);
+                    tfe->funcid = typmod_func;
+                    tfe->funcresulttype = dst_type;
+                    tfe->funcretset = false;
+                    tfe->funcvariadic = false;
+                    tfe->funcformat = COERCE_IMPLICIT_CAST;
+                    tfe->funccollid = InvalidOid;
+                    tfe->inputcollid = InvalidOid;
+                    tfe->args = list_make3(result,
+                        makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+                                  Int32GetDatum(dst_typmod), false, true),
+                        makeBoolConst(false, false));
+                    tfe->location = -1;
+                    result = (Expr *)tfe;
+                }
             }
             return result;
         }
@@ -1842,6 +2275,30 @@ convert_expression(const substrait::Expression &expr,
             return (Expr *)fe;
         }
 
+        if (fname == "abs")
+        {
+            if (sf.arguments_size() != 1)
+                throw SubstraitError("substrait: abs expects 1 arg");
+            Expr *arg = convert_expression(sf.arguments(0).value(),
+                                           schema, func_map, virtuals, outer_schema);
+            Oid argtype = exprType((Node *)arg);
+            Oid argtypes[1] = {argtype};
+            List *funcname = list_make1(makeString(pstrdup("abs")));
+            Oid funcoid = LookupFuncName(funcname, 1, argtypes, false);
+
+            FuncExpr *fe = makeNode(FuncExpr);
+            fe->funcid = funcoid;
+            fe->funcresulttype = argtype;
+            fe->funcretset = false;
+            fe->funcvariadic = false;
+            fe->funcformat = COERCE_EXPLICIT_CALL;
+            fe->funccollid = InvalidOid;
+            fe->inputcollid = InvalidOid;
+            fe->args = list_make1(arg);
+            fe->location = -1;
+            return (Expr *)fe;
+        }
+
         if (fname == "char_length" || fname == "character_length")
         {
             if (sf.arguments_size() != 1)
@@ -1862,6 +2319,81 @@ convert_expression(const substrait::Expression &expr,
             fe->args = list_make1(arg);
             fe->location = -1;
             return (Expr *)fe;
+        }
+
+        /* upper(text) / lower(text) */
+        if (fname == "upper" || fname == "lower")
+        {
+            if (sf.arguments_size() != 1)
+                throw SubstraitError(sfmt("substrait: %s expects 1 arg", fname.c_str()));
+            Expr *arg = coerce_to_text(convert_expression(
+                sf.arguments(0).value(), schema, func_map, virtuals, outer_schema));
+            Oid argtypes[1] = {TEXTOID};
+            List *funcname = list_make1(makeString(pstrdup(fname.c_str())));
+            Oid funcoid = LookupFuncName(funcname, 1, argtypes, false);
+            FuncExpr *fe = makeNode(FuncExpr);
+            fe->funcid = funcoid;
+            fe->funcresulttype = TEXTOID;
+            fe->funcretset = false;
+            fe->funcvariadic = false;
+            fe->funcformat = COERCE_EXPLICIT_CALL;
+            fe->funccollid = DEFAULT_COLLATION_OID;
+            fe->inputcollid = DEFAULT_COLLATION_OID;
+            fe->args = list_make1(arg);
+            fe->location = -1;
+            return (Expr *)fe;
+        }
+
+        /* is_not_distinct_from(a, b) → NOT (a IS DISTINCT FROM b) */
+        if (fname == "is_not_distinct_from")
+        {
+            if (sf.arguments_size() != 2)
+                throw SubstraitError("substrait: is_not_distinct_from expects 2 args");
+
+            Expr *left = convert_expression(sf.arguments(0).value(),
+                                            schema, func_map, virtuals, outer_schema);
+            Expr *right = convert_expression(sf.arguments(1).value(),
+                                             schema, func_map, virtuals, outer_schema);
+
+            Oid lefttype = exprType((Node *)left);
+            Oid righttype = exprType((Node *)right);
+
+            /* Coerce string types. */
+            if (is_string_type(lefttype) && is_string_type(righttype) &&
+                (lefttype != TEXTOID || righttype != TEXTOID))
+            {
+                left = coerce_to_text(left);
+                right = coerce_to_text(right);
+                lefttype = TEXTOID;
+                righttype = TEXTOID;
+            }
+
+            /* Look up the = operator for DistinctExpr. */
+            List *opname = list_make1(makeString(pstrdup("=")));
+            Oid opoid = LookupOperName(NULL, opname, lefttype, righttype,
+                                       false, -1);
+            HeapTuple optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(opoid));
+            Form_pg_operator opform = (Form_pg_operator)GETSTRUCT(optup);
+
+            /* DistinctExpr is IS DISTINCT FROM. */
+            DistinctExpr *de = makeNode(DistinctExpr);
+            de->opno = opoid;
+            de->opfuncid = opform->oprcode;
+            de->opresulttype = BOOLOID;
+            de->opretset = false;
+            de->opcollid = InvalidOid;
+            de->inputcollid = (is_string_type(lefttype) || is_string_type(righttype))
+                ? DEFAULT_COLLATION_OID : InvalidOid;
+            de->args = list_make2(left, right);
+            de->location = -1;
+            ReleaseSysCache(optup);
+
+            /* Negate: NOT (a IS DISTINCT FROM b) = a IS NOT DISTINCT FROM b. */
+            BoolExpr *notexpr = makeNode(BoolExpr);
+            notexpr->boolop = NOT_EXPR;
+            notexpr->args = list_make1(de);
+            notexpr->location = -1;
+            return (Expr *)notexpr;
         }
 
         /* Operator-based functions (comparison + arithmetic) */
@@ -1888,6 +2420,84 @@ convert_expression(const substrait::Expression &expr,
             {
                 left = coerce_to_text(left);
                 right = coerce_to_text(right);
+                lefttype = TEXTOID;
+                righttype = TEXTOID;
+            }
+
+            /* Coerce mismatched numeric/integer types for operator lookup.
+             * Only handle known-safe promotions to avoid planner issues. */
+            if (lefttype != righttype)
+            {
+                auto try_coerce = [](Expr *e, Oid src, Oid dst) -> Expr * {
+                    if (src == dst) return e;
+                    CoercionPathType path;
+                    Oid funcid;
+                    path = find_coercion_pathway(dst, src,
+                                                 COERCION_IMPLICIT, &funcid);
+                    if (path == COERCION_PATH_FUNC && OidIsValid(funcid))
+                    {
+                        FuncExpr *fe = makeNode(FuncExpr);
+                        fe->funcid = funcid;
+                        fe->funcresulttype = dst;
+                        fe->funcretset = false;
+                        fe->funcvariadic = false;
+                        fe->funcformat = COERCE_IMPLICIT_CAST;
+                        fe->funccollid = InvalidOid;
+                        fe->inputcollid = InvalidOid;
+                        fe->args = list_make1(e);
+                        fe->location = -1;
+                        return (Expr *)fe;
+                    }
+                    if (path == COERCION_PATH_RELABELTYPE)
+                    {
+                        RelabelType *r = makeNode(RelabelType);
+                        r->arg = e;
+                        r->resulttype = dst;
+                        r->resulttypmod = -1;
+                        r->resultcollid = InvalidOid;
+                        r->relabelformat = COERCE_IMPLICIT_CAST;
+                        r->location = -1;
+                        return (Expr *)r;
+                    }
+                    return NULL;
+                };
+
+                /* Try coercing right to left's type, then left to right's. */
+                Expr *rcoerced = try_coerce(right, righttype, lefttype);
+                if (rcoerced)
+                {
+                    right = rcoerced;
+                    righttype = lefttype;
+                }
+                else
+                {
+                    Expr *lcoerced = try_coerce(left, lefttype, righttype);
+                    if (lcoerced)
+                    {
+                        left = lcoerced;
+                        lefttype = righttype;
+                    }
+                }
+            }
+
+            /* Fallback: one side string, other not (e.g. integer = character).
+             * Coerce both to text so we can use the text operator. */
+            if (lefttype != righttype &&
+                (is_string_type(lefttype) != is_string_type(righttype)))
+            {
+                auto to_text = [](Expr *e, Oid t) -> Expr * {
+                    if (t == TEXTOID) return e;
+                    if (is_string_type(t)) return coerce_to_text(e);
+                    CoerceViaIO *cio = makeNode(CoerceViaIO);
+                    cio->arg = e;
+                    cio->resulttype = TEXTOID;
+                    cio->resultcollid = DEFAULT_COLLATION_OID;
+                    cio->coerceformat = COERCE_IMPLICIT_CAST;
+                    cio->location = -1;
+                    return (Expr *)cio;
+                };
+                left = to_text(left, lefttype);
+                right = to_text(right, righttype);
                 lefttype = TEXTOID;
                 righttype = TEXTOID;
             }
@@ -1925,6 +2535,137 @@ convert_expression(const substrait::Expression &expr,
 
         throw SubstraitError(sfmt("substrait: unsupported scalar function \"%s\"",
                                   fname.c_str()));
+    }
+
+    /* --- WindowFunction → WindowFunc node --- */
+    if (expr.has_window_function())
+    {
+        const auto &wf = expr.window_function();
+
+        auto fit = func_map.find(wf.function_reference());
+        if (fit == func_map.end())
+            throw SubstraitError(sfmt("substrait: unknown window function anchor %u",
+                                      wf.function_reference()));
+
+        const std::string &substrait_name = fit->second;
+
+        /* Resolve PG function OID — check agg map first, then window map,
+         * then try the raw name. */
+        std::string pg_name = substrait_name;
+        {
+            auto nit = kAggNameMap.find(substrait_name);
+            if (nit != kAggNameMap.end())
+                pg_name = nit->second;
+            else
+            {
+                auto wit = kWinFuncNameMap.find(substrait_name);
+                if (wit != kWinFuncNameMap.end())
+                    pg_name = wit->second;
+            }
+        }
+
+        /* Convert arguments. */
+        List *args = NIL;
+        std::vector<Oid> argtypes;
+        for (int i = 0; i < wf.arguments_size(); i++)
+        {
+            const auto &arg = wf.arguments(i);
+            if (!arg.has_value())
+                throw SubstraitError("substrait: non-value window function arg");
+            Expr *e = convert_expression(arg.value(), schema, func_map,
+                                         virtuals, outer_schema);
+            args = lappend(args, e);
+            argtypes.push_back(exprType((Node *)e));
+        }
+
+        /* Lookup function OID. */
+        bool is_star = (pg_name == "count" && argtypes.empty());
+        Oid winfnoid;
+        if (is_star)
+            winfnoid = lookup_count_star();
+        else if (pg_name == "count")
+            winfnoid = lookup_count_star();
+        else
+        {
+            List *funcname = list_make1(makeString(pstrdup(pg_name.c_str())));
+            winfnoid = LookupFuncName(funcname, (int)argtypes.size(),
+                                      argtypes.data(), false);
+        }
+
+        /* Get return type. */
+        HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(winfnoid));
+        if (!HeapTupleIsValid(proctup))
+            throw SubstraitError(sfmt("substrait: pg_proc missing for OID %u",
+                                      winfnoid));
+        Oid rettype = ((Form_pg_proc)GETSTRUCT(proctup))->prorettype;
+        ReleaseSysCache(proctup);
+
+        /* Check if this is an aggregate function (winagg flag). */
+        bool winagg = false;
+        {
+            HeapTuple aggtup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(winfnoid));
+            if (HeapTupleIsValid(aggtup))
+            {
+                winagg = true;
+                ReleaseSysCache(aggtup);
+            }
+        }
+
+        /* Build WindowFunc node. winref will be set by fixup_window_clauses. */
+        WindowFunc *wfn = makeNode(WindowFunc);
+        wfn->winfnoid = winfnoid;
+        wfn->wintype = rettype;
+        wfn->wincollid = is_string_type(rettype)
+            ? DEFAULT_COLLATION_OID : InvalidOid;
+        wfn->inputcollid = InvalidOid;
+        for (int i = 0; i < (int)argtypes.size(); i++)
+        {
+            if (is_string_type(argtypes[i]))
+            {
+                wfn->inputcollid = DEFAULT_COLLATION_OID;
+                break;
+            }
+        }
+        wfn->args = args;
+        wfn->aggfilter = NULL;
+        wfn->runCondition = NIL;
+        wfn->winref = 0;   /* fixed up later */
+        wfn->winstar = is_star;
+        wfn->winagg = winagg;
+        wfn->location = -1;
+
+        /* Convert partitions and sorts for deferred WindowClause creation. */
+        PendingWinSpec pws;
+        pws.partition_exprs = NIL;
+        for (int i = 0; i < wf.partitions_size(); i++)
+        {
+            Expr *pe = convert_expression(wf.partitions(i), schema,
+                                          func_map, virtuals, outer_schema);
+            pws.partition_exprs = lappend(pws.partition_exprs, pe);
+        }
+
+        pws.sort_exprs = NIL;
+        pws.sort_dirs = NIL;
+        for (int i = 0; i < wf.sorts_size(); i++)
+        {
+            const auto &sf = wf.sorts(i);
+            if (sf.has_expr())
+            {
+                Expr *se = convert_expression(sf.expr(), schema,
+                                              func_map, virtuals, outer_schema);
+                pws.sort_exprs = lappend(pws.sort_exprs, se);
+                int dir = sf.has_direction()
+                    ? (int)sf.direction()
+                    : (int)substrait::SortField::SORT_DIRECTION_ASC_NULLS_LAST;
+                pws.sort_dirs = lappend_int(pws.sort_dirs, dir);
+            }
+        }
+
+        pws.frame_options = substrait_bounds_to_frame(wf,
+            &pws.start_offset, &pws.end_offset);
+
+        g_pending_wins[wfn] = pws;
+        return (Expr *)wfn;
     }
 
     throw SubstraitError("substrait: unsupported expression type");
@@ -2024,8 +2765,7 @@ split_correlation_quals(Node *quals, List **corr_quals, Node **local_quals)
                             continue;
                         }
                     }
-                    else
-                        ReleaseSysCache(optup);
+                    /* else: invalid tuple, nothing to release */
                 }
             }
         }
@@ -2365,6 +3105,7 @@ pullup_expr_sublinks_mutator(Node *node, void *context)
         Var *result_var = makeVar(sub_rtindex, 1, result_type, -1,
             is_string_type(result_type)
                 ? DEFAULT_COLLATION_OID : InvalidOid, 0);
+        result_var->varnullingrels = bms_make_singleton(join_rtindex);
 
         return (Node *)result_var;
     }
@@ -2413,22 +3154,27 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                     const SubstraitSchema *outer_schema,
                     RelCache *rel_cache, int depth)
 {
-    /* CTE dedup: check if this subtree was already built. */
+    /* CTE dedup: check if this subtree was already built (hash-first). */
     std::string fp;
     bool is_dup = false;
     if (rel_cache)
     {
-        fp = fingerprint_rel(*cur);
-        if (rel_cache->duplicates.count(fp))
+        FpHash h = fingerprint_rel_hash(*cur, rel_cache->hash_cache);
+        if (rel_cache->dup_hashes.count(h))
         {
-            auto it = rel_cache->built.find(fp);
-            if (it != rel_cache->built.end())
+            const std::string &fp_ref = fingerprint_rel(*cur, *rel_cache);
+            fp = fp_ref;
+            if (rel_cache->duplicates.count(fp))
             {
-                /* Already built — return CTE reference. */
-                it->second.cte->cterefcount++;
-                return build_cte_ref_query(it->second, depth);
+                auto it = rel_cache->built.find(fp);
+                if (it != rel_cache->built.end())
+                {
+                    /* Already built — return CTE reference. */
+                    it->second.cte->cterefcount++;
+                    return build_cte_ref_query(it->second, depth);
+                }
+                is_dup = true;
             }
-            is_dup = true;
         }
     }
 
@@ -2509,14 +3255,19 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
     bool is_set = cur->has_set();
 
     /* If the inner node (after peeling wrappers) is a known duplicate,
-     * force the subquery path so the recursive call triggers CTE dedup. */
+     * force the subquery path so the recursive call triggers CTE dedup.
+     * Uses hash-first lookup to avoid unnecessary serialization. */
     if (rel_cache && (is_base || is_set))
     {
-        std::string inner_fp = fingerprint_rel(*cur);
-        if (rel_cache->duplicates.count(inner_fp))
+        FpHash h = fingerprint_rel_hash(*cur, rel_cache->hash_cache);
+        if (rel_cache->dup_hashes.count(h))
         {
-            is_base = false;
-            is_set = false;
+            const std::string &inner_fp = fingerprint_rel(*cur, *rel_cache);
+            if (rel_cache->duplicates.count(inner_fp))
+            {
+                is_base = false;
+                is_set = false;
+            }
         }
     }
 
@@ -2790,6 +3541,8 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
         foreach(lc, subq->targetList)
         {
             TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            if (tle->resjunk)
+                continue;
             colnames = lappend(colnames,
                 makeString(pstrdup(tle->resname ? tle->resname : "?column?")));
             Oid t = exprType((Node *)tle->expr);
@@ -2933,6 +3686,11 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
             name_idx++;
         }
 
+        /* WindowFunc fixup BEFORE emit: original pointers still match
+         * g_pending_wins, so winref gets set on the originals. Then
+         * copyObjectImpl in emit propagates the assigned winref. */
+        fixup_window_clauses(query);
+
         if (project_rel->has_common() &&
             project_rel->common().has_emit())
         {
@@ -3004,6 +3762,9 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
             query->targetList = new_tlist;
         }
     }
+
+    /* --- WindowFunc fixup: create WindowClause entries --- */
+    fixup_window_clauses(query);
 
     /* --- SortRel --- */
     if (sort_rel != nullptr)
@@ -3145,7 +3906,12 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
 static Query *
 substrait_to_query_impl(const uint8_t *data, size_t len)
 {
+    g_pending_wins.clear();
+
     substrait::Plan plan;
+    static constexpr size_t MAX_PLAN_SIZE = 64UL * 1024 * 1024;
+    if (len > MAX_PLAN_SIZE || len > (size_t)INT_MAX)
+        throw SubstraitError("substrait: plan too large");
     if (!plan.ParseFromArray(data, (int)len))
         throw SubstraitError("substrait: failed to deserialize protobuf Plan");
 
@@ -3164,20 +3930,35 @@ substrait_to_query_impl(const uint8_t *data, size_t len)
     /* Pre-scan: find duplicate Rel subtrees worth deduplicating. */
     RelCache rel_cache;
     {
-        std::unordered_map<std::string, int> counts;
-        count_rel_subtrees(root_rel, counts);
-        for (auto &[fp, cnt] : counts)
-        {
-            if (cnt >= 2 && fp.size() > 256)
-                rel_cache.duplicates.insert(fp);
-        }
+#ifdef AFS_DEBUG
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+#endif
+        count_rel_subtrees(root_rel, rel_cache);
+#ifdef AFS_DEBUG
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elog(LOG, "AFS_DEBUG: count_rel_subtrees %.3f ms, %zu dups",
+             (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+             rel_cache.duplicates.size());
+#endif
     }
 
     ereport(NOTICE, (errmsg("substrait: %zu duplicate fingerprints (threshold 256 bytes)",
                              rel_cache.duplicates.size())));
 
+#ifdef AFS_DEBUG
+    struct timespec tb0, tb1;
+    clock_gettime(CLOCK_MONOTONIC, &tb0);
+#endif
+
     Query *query = build_query_for_rel(&root_rel, func_map, root,
                                         nullptr, &rel_cache, 0);
+
+#ifdef AFS_DEBUG
+    clock_gettime(CLOCK_MONOTONIC, &tb1);
+    elog(LOG, "AFS_DEBUG: build_query_for_rel %.3f ms",
+         (tb1.tv_sec - tb0.tv_sec) * 1e3 + (tb1.tv_nsec - tb0.tv_nsec) / 1e6);
+#endif
 
     ereport(NOTICE, (errmsg("substrait: converter done, %d RTEs",
                              list_length(query->rtable))));
@@ -3199,6 +3980,8 @@ substrait_to_query(const uint8_t *data, size_t len)
         return substrait_to_query_impl(data, len);
     } catch (const SubstraitError &e) {
         ereport(ERROR, (errmsg("%s", e.what())));
+    } catch (const std::exception &e) {
+        ereport(ERROR, (errmsg("substrait: %s", e.what())));
     }
     pg_unreachable();
 }
