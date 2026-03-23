@@ -5,7 +5,7 @@ Substrait integration tests — TPC-H and TPC-DS.
 Ground truth: SQL on PostgreSQL via psql.
 Substrait execution: PG Flight SQL adapter.
 
-Run:   python3 substrait_test/test_substrait.py [--benchmark tpch|tpcds] [--sf SF] [query_numbers...]
+Run:   python3 substrait_test/test_substrait.py [--benchmark tpch|tpcds] [--sf SF] [query_labels...]
 """
 
 import argparse
@@ -14,7 +14,6 @@ import decimal
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -51,46 +50,46 @@ TPCH_TABLES = ["customer", "lineitem", "nation", "orders",
                "part", "partsupp", "region", "supplier"]
 
 TPCH_REQUIRES = {
-    1:  {"aggregate", "filter", "project", "read", "sort", "cast",
-         "interval_day"},
-    2:  {"aggregate", "filter", "project", "read", "sort", "fetch",
-         "cross", "cast", "subquery", "like"},
-    3:  {"aggregate", "filter", "project", "read", "sort", "fetch",
-         "cross", "cast"},
-    4:  {"aggregate", "filter", "project", "read", "sort", "subquery",
-         "interval_year"},
-    5:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast"},
-    6:  {"aggregate", "filter", "project", "read", "interval_year"},
-    7:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast",
-         "extract"},
-    8:  {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "if_then", "extract"},
-    9:  {"aggregate", "filter", "project", "read", "sort", "cross", "cast",
-         "like", "extract"},
-    10: {"aggregate", "filter", "project", "read", "sort", "fetch",
-         "cross", "cast"},
-    11: {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "subquery"},
-    12: {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "if_then"},
-    13: {"aggregate", "filter", "project", "read", "sort", "join", "cast",
-         "like"},
-    14: {"aggregate", "filter", "project", "read", "cross", "cast",
-         "if_then", "like"},
-    15: {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "subquery"},
-    16: {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "subquery", "like"},
-    17: {"aggregate", "filter", "project", "read", "cross", "cast",
-         "subquery"},
-    18: {"aggregate", "filter", "project", "read", "sort", "fetch",
-         "cross", "subquery"},
-    19: {"aggregate", "filter", "project", "read", "cross", "cast"},
-    20: {"aggregate", "filter", "project", "read", "sort", "cross",
-         "cast", "subquery", "like"},
-    21: {"aggregate", "filter", "project", "read", "sort", "fetch",
-         "cross", "subquery"},
-    22: {"aggregate", "filter", "project", "read", "sort", "subquery"},
+    "01": {"aggregate", "filter", "project", "read", "sort", "cast",
+           "interval_day"},
+    "02": {"aggregate", "filter", "project", "read", "sort", "fetch",
+           "cross", "cast", "subquery", "like"},
+    "03": {"aggregate", "filter", "project", "read", "sort", "fetch",
+           "cross", "cast"},
+    "04": {"aggregate", "filter", "project", "read", "sort", "subquery",
+           "interval_year"},
+    "05": {"aggregate", "filter", "project", "read", "sort", "cross", "cast"},
+    "06": {"aggregate", "filter", "project", "read", "interval_year"},
+    "07": {"aggregate", "filter", "project", "read", "sort", "cross", "cast",
+           "extract"},
+    "08": {"aggregate", "filter", "project", "read", "sort", "cross",
+           "cast", "if_then", "extract"},
+    "09": {"aggregate", "filter", "project", "read", "sort", "cross", "cast",
+           "like", "extract"},
+    "10": {"aggregate", "filter", "project", "read", "sort", "fetch",
+           "cross", "cast"},
+    "11": {"aggregate", "filter", "project", "read", "sort", "cross",
+           "cast", "subquery"},
+    "12": {"aggregate", "filter", "project", "read", "sort", "cross",
+           "cast", "if_then"},
+    "13": {"aggregate", "filter", "project", "read", "sort", "join", "cast",
+           "like"},
+    "14": {"aggregate", "filter", "project", "read", "cross", "cast",
+           "if_then", "like"},
+    "15": {"aggregate", "filter", "project", "read", "sort", "cross",
+           "cast", "subquery"},
+    "16": {"aggregate", "filter", "project", "read", "sort", "cross",
+           "cast", "subquery", "like"},
+    "17": {"aggregate", "filter", "project", "read", "cross", "cast",
+           "subquery"},
+    "18": {"aggregate", "filter", "project", "read", "sort", "fetch",
+           "cross", "subquery"},
+    "19": {"aggregate", "filter", "project", "read", "cross", "cast"},
+    "20": {"aggregate", "filter", "project", "read", "sort", "cross",
+           "cast", "subquery", "like"},
+    "21": {"aggregate", "filter", "project", "read", "sort", "fetch",
+           "cross", "subquery"},
+    "22": {"aggregate", "filter", "project", "read", "sort", "subquery"},
 }
 
 LINEITEM_ROWS = {"0.01": 60175, "0.1": 600572, "1": 6001215,
@@ -105,7 +104,13 @@ TPCDS_TABLES = [
     "web_returns", "web_sales", "catalog_sales", "store_sales",
 ]
 
-TPCDS_SKIP = set()  # previously skipped GROUPING queries (27,36,70,86)
+TPCDS_SKIP = set()
+
+# Queries skipped due to isthmus plan-generation bugs
+TPCDS_ISTHMUS_SKIP = {
+    "17": "isthmus: stddev_samp NULL",
+    "35": "isthmus: stddev_samp NULL",
+}
 
 STORE_SALES_ROWS = {"0.01": 28810, "0.1": 288464, "1": 2880404}
 
@@ -115,9 +120,9 @@ BENCHMARKS = {
         "schema": "tpch",
         "tables": TPCH_TABLES,
         "data_ext": ".tbl",
-        "num_queries": 22,
         "requires": TPCH_REQUIRES,
         "skip": set(),
+        "isthmus_skip": {},
         "check_table": "lineitem",
         "check_col": "l_orderkey",
         "check_rows": LINEITEM_ROWS,
@@ -127,14 +132,24 @@ BENCHMARKS = {
         "schema": "tpcds",
         "tables": TPCDS_TABLES,
         "data_ext": ".dat",
-        "num_queries": 99,
         "requires": {},
         "skip": TPCDS_SKIP,
+        "isthmus_skip": TPCDS_ISTHMUS_SKIP,
         "check_table": "store_sales",
         "check_col": "ss_item_sk",
         "check_rows": STORE_SALES_ROWS,
     },
 }
+
+
+def _discover_queries(bench):
+    """Discover available query labels from plan files."""
+    plans_dir = os.path.join(bench["dir"], "plans")
+    labels = []
+    for f in sorted(os.listdir(plans_dir)):
+        if f.endswith(".proto"):
+            labels.append(f[:-6])  # e.g. "01", "14a", "14b"
+    return labels
 
 
 # ============================================================
@@ -228,67 +243,55 @@ def _get_flight_helper():
         _flight_helper = subprocess.Popen(
             [sys.executable, helper],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True)
+            stderr=subprocess.PIPE)
     return _flight_helper
 
 
 def _stop_flight_helper():
     global _flight_helper
     if _flight_helper is not None and _flight_helper.poll() is None:
-        _flight_helper.stdin.write("\n")
+        _flight_helper.stdin.write(b"\n")
         _flight_helper.stdin.flush()
         _flight_helper.wait(timeout=5)
         _flight_helper = None
 
 
-def flight_exec_sql(sql):
-    with tempfile.NamedTemporaryFile(suffix=".sql", delete=False, mode="w") as sf:
-        sf.write(sql)
-        sql_path = sf.name
-    out_path = sql_path + ".arrow"
+def _read_exact(stream, n):
+    """Read exactly n bytes from a binary stream."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            raise RuntimeError("flight helper: unexpected EOF")
+        buf.extend(chunk)
+    return bytes(buf)
 
+
+def _flight_exec(proc, header, payload):
+    """Send command + payload, read Arrow IPC response inline."""
+    proc.stdin.write(f"{header} {len(payload)}\n".encode())
+    proc.stdin.write(payload)
+    proc.stdin.flush()
+
+    resp_line = proc.stdout.readline().decode().strip()
+    if resp_line.startswith("ERR "):
+        raise RuntimeError(resp_line[4:])
+    if not resp_line.startswith("OK "):
+        raise RuntimeError(f"unexpected response: {resp_line}")
+    nbytes = int(resp_line[3:])
+    ipc_data = _read_exact(proc.stdout, nbytes)
+    reader = ipc.open_stream(ipc_data)
+    return reader.read_all()
+
+
+def flight_exec_sql(sql):
     proc = _get_flight_helper()
-    try:
-        proc.stdin.write(f"SQL {sql_path} {out_path}\n")
-        proc.stdin.flush()
-        resp = proc.stdout.readline().strip()
-        if resp.startswith("ERR "):
-            raise RuntimeError(resp[4:])
-        if resp != "OK":
-            raise RuntimeError(f"unexpected response: {resp}")
-        reader = ipc.open_file(out_path)
-        return reader.read_all()
-    finally:
-        for p in (sql_path, out_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+    return _flight_exec(proc, "SQL", sql.encode("utf-8"))
 
 
 def flight_exec_substrait(plan_bytes):
-    with tempfile.NamedTemporaryFile(suffix=".proto", delete=False) as pf:
-        pf.write(plan_bytes)
-        plan_path = pf.name
-    out_path = plan_path + ".arrow"
-
     proc = _get_flight_helper()
-    try:
-        proc.stdin.write(f"{plan_path} {out_path}\n")
-        proc.stdin.flush()
-        resp = proc.stdout.readline().strip()
-        if resp.startswith("ERR "):
-            raise RuntimeError(resp[4:])
-        if resp != "OK":
-            raise RuntimeError(f"unexpected response: {resp}")
-        reader = ipc.open_file(out_path)
-        return reader.read_all()
-    finally:
-        for p in (plan_path, out_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+    return _flight_exec(proc, "PLAN", plan_bytes)
 
 
 # ============================================================
@@ -296,7 +299,7 @@ def flight_exec_substrait(plan_bytes):
 # ============================================================
 
 _monitor = None
-_monitor_log = []  # list of (qnr, rows, peak_rss_bytes, peak_cpu, status)
+_monitor_log = []  # list of (qlabel, rows, peak_rss_bytes, peak_cpu, status)
 
 
 def _find_pg_pid():
@@ -382,16 +385,15 @@ def _fmt_mb(nbytes):
 # Ground truth & Substrait execution
 # ============================================================
 
-def ground_truth_pg(bench, qnr, arrow=False):
+def ground_truth_pg(bench, qlabel, arrow=False):
     pgsql_dir = os.path.join(bench["dir"], "queries", "pgsql")
-    query_file = os.path.join(pgsql_dir, f"{qnr:02d}.sql")
+    query_file = os.path.join(pgsql_dir, f"{qlabel}.sql")
     with open(query_file) as f:
         sql = f.read().strip()
     if sql.endswith(";"):
         sql = sql[:-1]
     if arrow:
-        sql_with_path = f"SET search_path TO {bench['schema']};\n{sql}"
-        return table_to_rows(flight_exec_sql(sql_with_path))
+        return table_to_rows(flight_exec_sql(sql))
     return psql_csv(sql, search_path=bench["schema"])
 
 
@@ -490,39 +492,50 @@ def load_data(bench, sf):
 # ============================================================
 
 _results = {"pass": 0, "fail": 0, "skip": 0, "error": 0}
+_timing_log = []  # list of (qlabel, rows, status, pg_time, arrow_time, sub_time)
 
 
-def _has_order_by(bench, qnr):
+def _has_order_by(bench, qlabel):
     pgsql_dir = os.path.join(bench["dir"], "queries", "pgsql")
-    query_file = os.path.join(pgsql_dir, f"{qnr:02d}.sql")
+    query_file = os.path.join(pgsql_dir, f"{qlabel}.sql")
     with open(query_file) as f:
         return "order by" in f.read().lower()
 
 
-def run_query(bench, qnr, explain=False, arrow=False):
+def run_query(bench, qlabel, explain=False, arrow=False, compare=False):
     plans_dir = os.path.join(bench["dir"], "plans")
-    plan_file = os.path.join(plans_dir, f"{qnr:02d}.proto")
+    plan_file = os.path.join(plans_dir, f"{qlabel}.proto")
     with open(plan_file, "rb") as f:
         plan_bytes = f.read()
 
-    ordered = _has_order_by(bench, qnr)
+    ordered = _has_order_by(bench, qlabel)
 
+    # Ground truth: psql baseline
     t0 = time.monotonic()
-    expected = ground_truth_pg(bench, qnr, arrow=arrow)
+    expected = ground_truth_pg(bench, qlabel, arrow=arrow)
     pg_time_s = time.monotonic() - t0
     gt_label = "arrow" if arrow else "pg"
-    print(f"  {gt_label}={pg_time_s:.3f}s ({len(expected)} rows), running substrait...",
-          end=" ", flush=True)
+    print(f"  {gt_label}={pg_time_s:.3f}s ({len(expected)} rows)", end="", flush=True)
+
+    # Compare mode: also run Flight SQL (arrow) ground truth
+    arrow_time_s = None
+    if compare and not arrow:
+        t_arr = time.monotonic()
+        ground_truth_pg(bench, qlabel, arrow=True)
+        arrow_time_s = time.monotonic() - t_arr
+        print(f", arrow={arrow_time_s:.3f}s", end="", flush=True)
+
+    print(", running substrait...", end=" ", flush=True)
 
     if explain:
         pgsql_dir = os.path.join(bench["dir"], "queries", "pgsql")
-        query_file = os.path.join(pgsql_dir, f"{qnr:02d}.sql")
+        query_file = os.path.join(pgsql_dir, f"{qlabel}.sql")
         with open(query_file) as f:
             sql = f.read().strip().rstrip(";")
         explain_out = psql_run(
             f"SET search_path TO {bench['schema']};\n"
             f"EXPLAIN (ANALYZE, FORMAT TEXT) {sql};")
-        print(f"\n  -- PG EXPLAIN --\n{explain_out}")
+        print(f"\n  -- PG EXPLAIN (SQL) --\n{explain_out}")
 
     if _monitor:
         _monitor.start()
@@ -534,62 +547,83 @@ def run_query(bench, qnr, explain=False, arrow=False):
         substrait_time_s = time.monotonic() - t1
         if _monitor:
             peak_rss, peak_cpu = _monitor.stop()
-            _monitor_log.append((qnr, 0, peak_rss, peak_cpu, "FAIL",
+            _monitor_log.append((qlabel, 0, peak_rss, peak_cpu, "FAIL",
                                  pg_time_s, substrait_time_s))
         diff_s = substrait_time_s - pg_time_s
         print(f"FAIL (adapter error: {e}) "
               f"sub={substrait_time_s:.3f}s diff={diff_s:+.3f}s")
         _results["fail"] += 1
+        _timing_log.append((qlabel, 0, "FAIL", pg_time_s, arrow_time_s,
+                            substrait_time_s))
         return
 
     peak_rss = peak_cpu = 0
     if _monitor:
         peak_rss, peak_cpu = _monitor.stop()
 
+    # Read substrait EXPLAIN if available (written by adapter per-query)
+    if explain:
+        explain_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
+        sub_explain_path = os.path.join(explain_dir, "latest.txt")
+        if os.path.exists(sub_explain_path):
+            with open(sub_explain_path) as ef:
+                print(f"\n  -- SUBSTRAIT EXPLAIN --\n{ef.read()}")
+
     diff_s = substrait_time_s - pg_time_s
     ok, diff = rows_equal(expected, actual, ordered=ordered)
+    status = "PASS" if ok else "FAIL"
     if ok:
         print(f"PASS sub={substrait_time_s:.3f}s diff={diff_s:+.3f}s")
         _results["pass"] += 1
         if _monitor:
-            _monitor_log.append((qnr, len(expected), peak_rss, peak_cpu, "PASS",
+            _monitor_log.append((qlabel, len(expected), peak_rss, peak_cpu, "PASS",
                                  pg_time_s, substrait_time_s))
     else:
         print(f"FAIL ({diff}) sub={substrait_time_s:.3f}s diff={diff_s:+.3f}s")
         _results["fail"] += 1
         if _monitor:
-            _monitor_log.append((qnr, len(expected), peak_rss, peak_cpu, "FAIL",
+            _monitor_log.append((qlabel, len(expected), peak_rss, peak_cpu, "FAIL",
                                  pg_time_s, substrait_time_s))
 
+    _timing_log.append((qlabel, len(expected) if ok else len(actual),
+                        status, pg_time_s, arrow_time_s, substrait_time_s))
 
-def run_benchmark(bench, sf, queries=None, explain=False, arrow=False):
+
+def run_benchmark(bench, sf, queries=None, explain=False, arrow=False,
+                  compare=False):
     name = bench["schema"].upper()
-    num_queries = bench["num_queries"]
     requires = bench["requires"]
     skip = bench["skip"]
+    isthmus_skip = bench.get("isthmus_skip", {})
 
     print(f"\n{name}")
     print("-" * 60)
 
     if queries is None:
-        queries = list(range(1, num_queries + 1))
+        queries = _discover_queries(bench)
 
     any_runnable = any(
-        q not in skip and not (requires.get(q, set()) - IMPLEMENTED)
+        q not in skip and q not in isthmus_skip
+        and not (requires.get(q, set()) - IMPLEMENTED)
         for q in queries
     )
     if any_runnable:
         load_data(bench, sf)
 
-    for qnr in queries:
-        print(f"\n{name} Q{qnr:02d}")
+    for qlabel in queries:
+        print(f"\n{name} Q{qlabel}")
 
-        if qnr in skip:
+        if qlabel in skip:
             print(f"  SKIP (no plan)")
             _results["skip"] += 1
             continue
 
-        required = requires.get(qnr, set())
+        if qlabel in isthmus_skip:
+            print(f"  SKIP ({isthmus_skip[qlabel]})")
+            _results["skip"] += 1
+            continue
+
+        required = requires.get(qlabel, set())
         missing = required - IMPLEMENTED
         if missing:
             print(f"  SKIP (need {missing})")
@@ -597,7 +631,8 @@ def run_benchmark(bench, sf, queries=None, explain=False, arrow=False):
             continue
 
         try:
-            run_query(bench, qnr, explain=explain, arrow=arrow)
+            run_query(bench, qlabel, explain=explain, arrow=arrow,
+                      compare=compare)
         except Exception as e:
             print(f"  ERROR: {e}")
             _results["error"] += 1
@@ -622,9 +657,23 @@ def main():
                         help="Print EXPLAIN ANALYZE for PG ground truth queries")
     parser.add_argument("--arrow", action="store_true",
                         help="Run ground truth SQL via Flight SQL adapter instead of psql")
-    parser.add_argument("queries", nargs="*", type=int,
-                        help="query numbers to run (default: all)")
+    parser.add_argument("--compare", action="store_true",
+                        help="Run psql + arrow + substrait, print comparison table")
+    parser.add_argument("--background", action="store_true",
+                        help="Daemonize and write output to output.txt")
+    parser.add_argument("queries", nargs="*", type=str,
+                        help="query labels to run (default: all)")
     args = parser.parse_args()
+
+    if args.background:
+        pid = os.fork()
+        if pid > 0:
+            print(f"Backgrounded (pid={pid}), output -> output.txt")
+            sys.exit(0)
+        os.setsid()
+        out = open("output.txt", "w", buffering=1)  # line-buffered
+        sys.stdout = out
+        sys.stderr = out
 
     if args.monitor:
         pg_pid = _find_pg_pid()
@@ -637,8 +686,8 @@ def main():
     bench = BENCHMARKS[args.benchmark]
     queries = args.queries or None
 
-    if args.explain:
-        os.environ["AFS_EXPLAIN"] = "1"
+    if args.explain or args.compare:
+        os.environ["AFS_EXPLAIN"] = "analyze"
 
     print("Substrait integration tests")
     print("=" * 60)
@@ -647,8 +696,11 @@ def main():
     print(f"Scale factor: {args.sf}")
     if args.arrow:
         print("Ground truth: Flight SQL (--arrow)")
+    if args.compare:
+        print("Compare mode: psql + arrow + substrait")
 
-    run_benchmark(bench, args.sf, queries, explain=args.explain, arrow=args.arrow)
+    run_benchmark(bench, args.sf, queries, explain=args.explain,
+                  arrow=args.arrow, compare=args.compare)
 
     _stop_flight_helper()
 
@@ -656,6 +708,68 @@ def main():
                   _results["skip"], _results["error"]
     print("\n" + "=" * 60)
     print(f"{p} passed, {f} failed, {s} skipped, {e} errors")
+
+    # Timing comparison table (always printed if we have data)
+    if _timing_log:
+        has_arrow = any(t[4] is not None for t in _timing_log)
+        if has_arrow:
+            print(f"\n{'Query':<8} {'Status':<6} {'Rows':>8} "
+                  f"{'PG':>9} {'Arrow':>9} {'Substr':>9} "
+                  f"{'Sub/PG':>7} {'Sub/Arr':>8} {'Arr/PG':>7}")
+            print("-" * 82)
+            tot_pg = tot_arr = tot_sub = 0.0
+            for qlabel, rows, st, pg_t, arr_t, sub_t in _timing_log:
+                ratio_pg = sub_t / pg_t if pg_t > 0 else float('inf')
+                ratio_arr = sub_t / arr_t if arr_t and arr_t > 0 else 0
+                arr_pg = arr_t / pg_t if arr_t and pg_t > 0 else 0
+                arr_s = f"{arr_t:>8.3f}s" if arr_t else f"{'n/a':>9}"
+                r_arr = f"{ratio_arr:>7.1f}x" if arr_t else f"{'n/a':>8}"
+                r_apg = f"{arr_pg:>6.1f}x" if arr_t else f"{'n/a':>7}"
+                print(f"Q{qlabel:<7} {st:<6} {rows:>8} "
+                      f"{pg_t:>8.3f}s {arr_s} {sub_t:>8.3f}s "
+                      f"{ratio_pg:>6.1f}x {r_arr} {r_apg}")
+                tot_pg += pg_t
+                tot_arr += arr_t or 0
+                tot_sub += sub_t
+            print("-" * 82)
+            if tot_pg > 0:
+                print(f"{'TOTAL':<8} {'':6} {'':>8} "
+                      f"{tot_pg:>8.3f}s {tot_arr:>8.3f}s {tot_sub:>8.3f}s "
+                      f"{tot_sub/tot_pg:>6.1f}x "
+                      f"{tot_sub/tot_arr if tot_arr > 0 else 0:>7.1f}x "
+                      f"{tot_arr/tot_pg if tot_pg > 0 else 0:>6.1f}x")
+        else:
+            print(f"\n{'Query':<8} {'Status':<6} {'Rows':>8} "
+                  f"{'PG':>9} {'Substr':>9} {'Sub/PG':>7}")
+            print("-" * 55)
+            tot_pg = tot_sub = 0.0
+            for qlabel, rows, st, pg_t, _, sub_t in _timing_log:
+                ratio = sub_t / pg_t if pg_t > 0 else float('inf')
+                print(f"Q{qlabel:<7} {st:<6} {rows:>8} "
+                      f"{pg_t:>8.3f}s {sub_t:>8.3f}s {ratio:>6.1f}x")
+                tot_pg += pg_t
+                tot_sub += sub_t
+            print("-" * 55)
+            if tot_pg > 0:
+                print(f"{'TOTAL':<8} {'':6} {'':>8} "
+                      f"{tot_pg:>8.3f}s {tot_sub:>8.3f}s "
+                      f"{tot_sub/tot_pg:>6.1f}x")
+
+        # Write timing CSV
+        csv_path = os.path.join(SCRIPT_DIR,
+                                f"timing_{args.benchmark}_sf{args.sf}.csv")
+        with open(csv_path, "w", newline="") as cf:
+            w = csv.writer(cf)
+            w.writerow(["sf", "query", "status", "rows",
+                         "pg_time_s", "arrow_time_s", "substrait_time_s",
+                         "sub_pg_ratio"])
+            for qlabel, rows, st, pg_t, arr_t, sub_t in _timing_log:
+                ratio = sub_t / pg_t if pg_t > 0 else 0
+                w.writerow([args.sf, f"Q{qlabel}", st, rows,
+                            f"{pg_t:.3f}",
+                            f"{arr_t:.3f}" if arr_t else "",
+                            f"{sub_t:.3f}", f"{ratio:.2f}"])
+        print(f"\nTiming CSV: {csv_path}")
 
     if _monitor and _monitor_log:
         csv_path = os.path.join(SCRIPT_DIR,
@@ -665,8 +779,8 @@ def main():
             w.writerow(["sf", "query", "status", "rows",
                          "peak_rss_mb", "peak_cpu_pct",
                          "pg_time_s", "substrait_time_s", "diff_s"])
-            for qnr, rows, rss, cpu, status, pg_t, sub_t in _monitor_log:
-                w.writerow([args.sf, f"Q{qnr:02d}", status, rows,
+            for qlabel, rows, rss, cpu, status, pg_t, sub_t in _monitor_log:
+                w.writerow([args.sf, f"Q{qlabel}", status, rows,
                             f"{rss / (1024*1024):.1f}", f"{cpu:.0f}",
                             f"{pg_t:.3f}", f"{sub_t:.3f}",
                             f"{sub_t - pg_t:+.3f}"])
@@ -675,8 +789,8 @@ def main():
               f"{'Peak RSS':>10} {'Peak CPU':>10} "
               f"{'PG Time':>9} {'Sub Time':>9} {'Diff':>9}")
         print("-" * 75)
-        for qnr, rows, rss, cpu, status, pg_t, sub_t in _monitor_log:
-            print(f"Q{qnr:02d}      {status:<8} {rows:>8} "
+        for qlabel, rows, rss, cpu, status, pg_t, sub_t in _monitor_log:
+            print(f"Q{qlabel:<7} {status:<8} {rows:>8} "
                   f"{_fmt_mb(rss):>10} {cpu:>9.0f}% "
                   f"{pg_t:>8.3f}s {sub_t:>8.3f}s {sub_t - pg_t:>+8.3f}s")
         print("-" * 75)
