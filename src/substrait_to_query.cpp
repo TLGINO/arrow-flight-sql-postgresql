@@ -2400,6 +2400,55 @@ convert_expression(const substrait::Expression &expr,
                                            schema, func_map, virtuals, outer_schema, rel_cache, depth);
             Expr *scale = convert_expression(sf.arguments(1).value(),
                                              schema, func_map, virtuals, outer_schema, rel_cache, depth);
+
+            /* Coerce first arg to numeric if needed (e.g. int8 from SUM). */
+            Oid valtype = exprType((Node *)val);
+            if (valtype != NUMERICOID)
+            {
+                CoercionPathType cpath;
+                Oid cfuncid;
+                cpath = find_coercion_pathway(NUMERICOID, valtype,
+                                              COERCION_IMPLICIT, &cfuncid);
+                if (cpath == COERCION_PATH_FUNC && OidIsValid(cfuncid))
+                {
+                    FuncExpr *cfe = makeNode(FuncExpr);
+                    cfe->funcid = cfuncid;
+                    cfe->funcresulttype = NUMERICOID;
+                    cfe->funcretset = false;
+                    cfe->funcvariadic = false;
+                    cfe->funcformat = COERCE_IMPLICIT_CAST;
+                    cfe->funccollid = InvalidOid;
+                    cfe->inputcollid = InvalidOid;
+                    cfe->args = list_make1(val);
+                    cfe->location = -1;
+                    val = (Expr *)cfe;
+                }
+            }
+
+            /* Coerce second arg to int4 if needed. */
+            Oid scaletype = exprType((Node *)scale);
+            if (scaletype != INT4OID)
+            {
+                CoercionPathType cpath;
+                Oid cfuncid;
+                cpath = find_coercion_pathway(INT4OID, scaletype,
+                                              COERCION_IMPLICIT, &cfuncid);
+                if (cpath == COERCION_PATH_FUNC && OidIsValid(cfuncid))
+                {
+                    FuncExpr *cfe = makeNode(FuncExpr);
+                    cfe->funcid = cfuncid;
+                    cfe->funcresulttype = INT4OID;
+                    cfe->funcretset = false;
+                    cfe->funcvariadic = false;
+                    cfe->funcformat = COERCE_IMPLICIT_CAST;
+                    cfe->funccollid = InvalidOid;
+                    cfe->inputcollid = InvalidOid;
+                    cfe->args = list_make1(scale);
+                    cfe->location = -1;
+                    scale = (Expr *)cfe;
+                }
+            }
+
             Oid argtypes[2] = {NUMERICOID, INT4OID};
             List *funcname = list_make1(makeString(pstrdup("round")));
             Oid funcoid = LookupFuncName(funcname, 2, argtypes, false);
@@ -3619,7 +3668,16 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
              * WHERE. PG with join_collapse_limit=20 optimizes
              * FROM A, B, C WHERE ... into proper hash/merge joins.
              */
-            query->jointree->quals = fexpr;
+            if (query->jointree->quals == NULL)
+                query->jointree->quals = fexpr;
+            else
+            {
+                BoolExpr *and_expr = makeNode(BoolExpr);
+                and_expr->boolop = AND_EXPR;
+                and_expr->args = list_make2(query->jointree->quals, fexpr);
+                and_expr->location = -1;
+                query->jointree->quals = (Node *)and_expr;
+            }
         }
         else if (cur->has_read() && cur->read().has_filter())
         {
