@@ -135,7 +135,8 @@ static const int MaxNRowsPerRecordBatchDefault = 1 * 1024 * 1024;
 static int MaxNRowsPerRecordBatch;
 
 // AFS_EXPLAIN=analyze: log EXPLAIN ANALYZE for each Substrait query
-static bool AfsExplainAnalyze = false;
+// 0=off, 1=plan-only (no execution), 2=analyze (full execution)
+static int AfsExplainMode = 0;
 static const char* AfsExplainDir = "/tmp/afs_explain";
 
 static volatile sig_atomic_t GotSIGTERM = false;
@@ -1573,7 +1574,7 @@ class Executor : public WorkerProcessor {
 			{
 				// TODO: Customizable.
 				SharedRingBuffer::allocate_data(
-					&(session->bufferData), area_, 1L * 1024L * 1024L);
+					&(session->bufferData), area_, 8L * 1024L * 1024L);
 			}
 			session->initialized = true;
 			localSession_->valid = true;
@@ -1974,6 +1975,36 @@ class Executor : public WorkerProcessor {
 			SetCurrentStatementStartTimestamp();
 			SPI_connect();
 			needFinish_ = true;
+
+			if (AfsExplainMode >= 1)
+			{
+				std::string explain_sql = (AfsExplainMode >= 2)
+					? "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + query
+					: "EXPLAIN (COSTS, FORMAT TEXT) " + query;
+				auto eres = SPI_execute(explain_sql.c_str(), true, 0);
+				if (eres > 0 && SPI_tuptable)
+				{
+					mkdir(AfsExplainDir, 0755);
+					std::string path =
+						std::string(AfsExplainDir) + "/select_sql.txt";
+					std::ofstream out(path);
+					if (out)
+					{
+						for (uint64 r = 0; r < SPI_processed; r++)
+						{
+							char *line = SPI_getvalue(
+								SPI_tuptable->vals[r],
+								SPI_tuptable->tupdesc, 1);
+							if (line)
+							{
+								out << line << "\n";
+								pfree(line);
+							}
+						}
+					}
+				}
+			}
+
 			auto result = SPI_execute(query.c_str(), true, 0);
 			if (result > 0)
 			{
@@ -2064,6 +2095,12 @@ class Executor : public WorkerProcessor {
 			set_config_option("geqo_threshold", "20",
 				PGC_USERSET, PGC_S_SESSION,
 				GUC_ACTION_LOCAL, true, ERROR, false);
+			set_config_option("max_parallel_workers_per_gather", "2",
+				PGC_USERSET, PGC_S_SESSION,
+				GUC_ACTION_LOCAL, true, ERROR, false);
+			set_config_option("work_mem", "256MB",
+				PGC_USERSET, PGC_S_SESSION,
+				GUC_ACTION_LOCAL, true, ERROR, false);
 
 			PlannedStmt* pstmt = standard_planner(query, "<substrait>", 0, NULL);
 
@@ -2075,13 +2112,13 @@ class Executor : public WorkerProcessor {
 
 			PushActiveSnapshot(GetTransactionSnapshot());
 
-		if (AfsExplainAnalyze)
+		if (AfsExplainMode >= 1)
 			{
 				ExplainState* es = NewExplainState();
-				es->analyze = true;
+				es->analyze = (AfsExplainMode >= 2);
 				es->costs = true;
-				es->buffers = true;
-				es->timing = true;
+				es->buffers = (AfsExplainMode >= 2);
+				es->timing = (AfsExplainMode >= 2);
 				es->summary = true;
 				es->format = EXPLAIN_FORMAT_TEXT;
 
@@ -2091,10 +2128,15 @@ class Executor : public WorkerProcessor {
 				ExplainEndOutput(es);
 
 				mkdir(AfsExplainDir, 0755);
-				std::string path = std::string(AfsExplainDir) + "/latest.txt";
-				std::ofstream out(path);
-				if (out)
-					out << es->str->data;
+				/* Write both per-query and latest file */
+				std::string per_query = std::string(AfsExplainDir) + "/" + tag + ".txt";
+				std::string latest = std::string(AfsExplainDir) + "/latest.txt";
+				for (auto &path : {per_query, latest})
+				{
+					std::ofstream out(path);
+					if (out)
+						out << es->str->data;
+				}
 
 				pfree(es->str->data);
 				pfree(es);
@@ -2111,6 +2153,21 @@ class Executor : public WorkerProcessor {
 
 			TupleDesc tupdesc = qdesc->tupDesc;
 
+		if (AfsExplainMode == 1)
+		{
+			// Plan-only: write empty schema result, skip execution
+			auto status = write_empty_schema_streaming(tag, tupdesc);
+			if (!status.ok())
+			{
+				set_error_message(
+					session,
+					std::string(Tag) + ": " + tag_ + ": " + tag +
+						": failed to write schema: " + status.ToString(),
+					tag);
+			}
+		}
+		else
+		{
 			pgstat_report_activity(
 				STATE_RUNNING,
 				(std::string(Tag) + ": " + tag + ": writing").c_str());
@@ -2134,6 +2191,7 @@ class Executor : public WorkerProcessor {
 #endif
 
 			ExecutorFinish(qdesc);
+		}
 			ExecutorEnd(qdesc);
 			PopActiveSnapshot();
 			FreeQueryDesc(qdesc);
@@ -2257,6 +2315,42 @@ class Executor : public WorkerProcessor {
 
 	// Streaming variant: builds Arrow batches directly from ExecProcNode
 	// output without materializing all tuples first.
+	arrow::Status write_empty_schema_streaming(
+		const char* tag, TupleDesc tupdesc)
+	{
+		SharedRingBufferOutputStream output(this, localSession_);
+		int natts = tupdesc->natts;
+
+		std::vector<std::shared_ptr<arrow::Field>> fields;
+		for (int i = 0; i < natts; ++i)
+		{
+			auto attribute = TupleDescAttr(tupdesc, i);
+			ARROW_ASSIGN_OR_RAISE(auto type,
+			                      ArrowArrayBuilderBase::arrow_type(attribute));
+			fields.push_back(arrow::field(
+				NameStr(attribute->attname), std::move(type),
+				!attribute->attnotnull));
+		}
+		auto schema = arrow::schema(fields);
+		auto options = arrow::ipc::IpcWriteOptions::Defaults();
+
+		// Schema batch (empty)
+		ARROW_ASSIGN_OR_RAISE(auto writer,
+		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
+		ARROW_ASSIGN_OR_RAISE(
+			auto builder,
+			arrow::RecordBatchBuilder::Make(schema, arrow::default_memory_pool()));
+		ARROW_ASSIGN_OR_RAISE(auto recordBatch, builder->Flush());
+		ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+		ARROW_RETURN_NOT_OK(writer->Close());
+
+		// Data stream (empty, just close)
+		ARROW_ASSIGN_OR_RAISE(writer,
+		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
+		ARROW_RETURN_NOT_OK(writer->Close());
+		return output.Close();
+	}
+
 	arrow::Status write_record_batches_streaming(
 		const char* tag, TupleDesc tupdesc, QueryDesc* qdesc)
 	{
@@ -2309,9 +2403,18 @@ class Executor : public WorkerProcessor {
 		uint64_t nRowsInBatch = 0;
 		uint64_t totalRows = 0;
 
+		// Fine-grained timing (always-on, minimal overhead)
+		struct timespec t_fetch_start, t_fetch_end, t_append_end;
+		double fetch_ns = 0, append_ns = 0, ipc_ns = 0;
+
 		for (;;)
 		{
+			clock_gettime(CLOCK_MONOTONIC, &t_fetch_start);
 			TupleTableSlot* slot = ExecProcNode(qdesc->planstate);
+			clock_gettime(CLOCK_MONOTONIC, &t_fetch_end);
+			fetch_ns += (t_fetch_end.tv_sec - t_fetch_start.tv_sec) * 1e9
+			          + (t_fetch_end.tv_nsec - t_fetch_start.tv_nsec);
+
 			if (TupIsNull(slot))
 				break;
 
@@ -2320,14 +2423,22 @@ class Executor : public WorkerProcessor {
 			{
 				ARROW_RETURN_NOT_OK(builders[i]->append_from_slot(slot));
 			}
+			clock_gettime(CLOCK_MONOTONIC, &t_append_end);
+			append_ns += (t_append_end.tv_sec - t_fetch_end.tv_sec) * 1e9
+			           + (t_append_end.tv_nsec - t_fetch_end.tv_nsec);
 			nRowsInBatch++;
 
 			if (nRowsInBatch >= static_cast<uint64_t>(MaxNRowsPerRecordBatch))
 			{
+				struct timespec t_ipc_start, t_ipc_end;
+				clock_gettime(CLOCK_MONOTONIC, &t_ipc_start);
 				ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
 				P("%s: %s: %s: write: data: WriteRecordBatch: %" PRIu64 "/%" PRIu64,
 				  Tag, tag_, tag, totalRows, totalRows + nRowsInBatch);
 				ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+				clock_gettime(CLOCK_MONOTONIC, &t_ipc_end);
+				ipc_ns += (t_ipc_end.tv_sec - t_ipc_start.tv_sec) * 1e9
+				         + (t_ipc_end.tv_nsec - t_ipc_start.tv_nsec);
 				totalRows += nRowsInBatch;
 				nRowsInBatch = 0;
 			}
@@ -2336,11 +2447,21 @@ class Executor : public WorkerProcessor {
 		// Flush remaining rows
 		if (nRowsInBatch > 0)
 		{
+			struct timespec t_ipc_start, t_ipc_end;
+			clock_gettime(CLOCK_MONOTONIC, &t_ipc_start);
 			ARROW_ASSIGN_OR_RAISE(recordBatch, builder->Flush());
 			P("%s: %s: %s: write: data: WriteRecordBatch: last: %" PRIu64 "/%" PRIu64,
 			  Tag, tag_, tag, totalRows, totalRows + nRowsInBatch);
 			ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
+			clock_gettime(CLOCK_MONOTONIC, &t_ipc_end);
+			ipc_ns += (t_ipc_end.tv_sec - t_ipc_start.tv_sec) * 1e9
+			         + (t_ipc_end.tv_nsec - t_ipc_start.tv_nsec);
+			totalRows += nRowsInBatch;
 		}
+
+		elog(LOG, "AFS_PERF %s: streaming %" PRIu64 " rows: "
+			"fetch=%.1f ms, arrow_append=%.1f ms, ipc_write=%.1f ms",
+			tag, totalRows, fetch_ns / 1e6, append_ns / 1e6, ipc_ns / 1e6);
 
 		P("%s: %s: %s: write: data: Close", Tag, tag_, tag);
 		ARROW_RETURN_NOT_OK(writer->Close());
@@ -4712,8 +4833,10 @@ afs_executor(Datum arg)
 	// Check AFS_EXPLAIN env var
 	{
 		const char* explain = getenv("AFS_EXPLAIN");
-		if (explain && strcmp(explain, "analyze") == 0)
-			AfsExplainAnalyze = true;
+		if (explain && strcmp(explain, "plan") == 0)
+			AfsExplainMode = 1;
+		else if (explain && strcmp(explain, "analyze") == 0)
+			AfsExplainMode = 2;
 		const char* dir = getenv("AFS_EXPLAIN_DIR");
 		if (dir)
 			AfsExplainDir = dir;

@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Long-running Flight SQL helper: reads plan paths from stdin, writes Arrow IPC
-results. Reuses a single Flight SQL client/session across all queries.
+Long-running Flight SQL helper: reads plan/SQL from stdin, writes Arrow IPC
+results to stdout. Reuses a single Flight SQL client/session across all queries.
 Reconnects automatically on auth errors.
 
-Protocol (line-based on stdin/stdout):
-  IN:  <plan_path> <out_path>        # execute Substrait plan
-  IN:  SQL <sql_path> <out_path>     # execute SQL query
-  OUT: OK
-  OUT: ERR <message>
-  IN:  (empty line or EOF) → exit
+Protocol (binary on stdin/stdout):
+  IN:  b"PLAN <nbytes>\n" + <plan_bytes>     # execute Substrait plan
+  IN:  b"SQL <nbytes>\n"  + <sql_bytes>      # execute SQL query
+  OUT: b"OK <nbytes>\n"   + <arrow_ipc>      # Arrow IPC stream
+  OUT: b"ERR <message>\n"                     # error
+  IN:  b"\n" or EOF → exit
 """
 import sys
 import traceback
 
 import os
 
+import pyarrow as pa
 import pyarrow.flight as flight
 import pyarrow.ipc as ipc
 
@@ -79,44 +80,72 @@ class FlightHelper:
         return reader.read_all()
 
 
+def read_exact(stream, n):
+    """Read exactly n bytes from a binary stream."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            raise EOFError("unexpected EOF")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def table_to_ipc_bytes(table):
+    """Serialize an Arrow table to IPC stream bytes."""
+    sink = pa.BufferOutputStream()
+    writer = ipc.new_stream(sink, table.schema)
+    writer.write_table(table)
+    writer.close()
+    return sink.getvalue().to_pybytes()
+
+
 def main():
     helper = FlightHelper()
     helper.connect()
 
-    for line in sys.stdin:
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+
+    while True:
+        line = stdin.readline()
+        if not line:
+            break
         line = line.strip()
         if not line:
             break
 
         try:
-            parts = line.split(None, 2)
-            if parts[0] == "SQL":
-                sql_path, out_path = parts[1], parts[2]
-                with open(sql_path, "r") as f:
-                    query = f.read()
+            text = line.decode("utf-8")
+            if text.startswith("PLAN "):
+                nbytes = int(text[5:])
+                plan_bytes = read_exact(stdin, nbytes)
                 try:
-                    table = helper.execute_sql(query)
+                    table = helper.execute(plan_bytes)
                 except flight.FlightUnauthorizedError:
                     helper.connect()
-                    table = helper.execute_sql(query)
+                    table = helper.execute(plan_bytes)
+            elif text.startswith("SQL "):
+                nbytes = int(text[4:])
+                sql = read_exact(stdin, nbytes).decode("utf-8")
+                try:
+                    table = helper.execute_sql(sql)
+                except flight.FlightUnauthorizedError:
+                    helper.connect()
+                    table = helper.execute_sql(sql)
             else:
-                plan_path, out_path = parts[0], parts[1]
-                with open(plan_path, "rb") as f:
-                    plan_bytes = f.read()
-                try:
-                    table = helper.execute(plan_bytes)
-                except flight.FlightUnauthorizedError:
-                    helper.connect()
-                    table = helper.execute(plan_bytes)
+                stdout.write(b"ERR unknown command\n")
+                stdout.flush()
+                continue
 
-            writer = ipc.new_file(out_path, table.schema)
-            writer.write_table(table)
-            writer.close()
-
-            print("OK", flush=True)
+            ipc_bytes = table_to_ipc_bytes(table)
+            stdout.write(f"OK {len(ipc_bytes)}\n".encode())
+            stdout.write(ipc_bytes)
+            stdout.flush()
         except Exception:
             msg = traceback.format_exc().strip().split("\n")[-1]
-            print(f"ERR {msg}", flush=True)
+            stdout.write(f"ERR {msg}\n".encode())
+            stdout.flush()
 
     if helper.client:
         helper.client.close()
