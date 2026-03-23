@@ -14,6 +14,7 @@ import decimal
 import os
 import subprocess
 import sys
+import concurrent.futures
 import threading
 import time
 
@@ -446,6 +447,16 @@ def _ensure_search_path(bench):
     psql_run(f"ALTER DATABASE postgres SET search_path TO public, {schema};")
 
 
+def _copy_table(schema, ext, data_dir, table):
+    """COPY a single table — called from thread pool."""
+    data_file = os.path.join(data_dir, f"{table}{ext}")
+    if not os.path.exists(data_file):
+        raise RuntimeError(f"Missing data file: {data_file}")
+    copy_sql = (f"\\COPY {schema}.{table} FROM '{data_file}' "
+                f"WITH (FORMAT csv, DELIMITER '|', NULL '');")
+    psql_run(copy_sql)
+
+
 def load_data(bench, sf):
     key = bench["schema"]
     if key in _loaded:
@@ -458,12 +469,15 @@ def load_data(bench, sf):
         _loaded[key] = True
         return
 
+    t0 = time.time()
     print(f"  Loading {key} sf={sf} into PostgreSQL ... ", end="", flush=True)
 
     sf_dir = SF_DIR_MAP[sf]
     data_dir = os.path.join(bench["dir"], "data", sf_dir)
     init_sql = os.path.join(bench["dir"], "pg_init.sql")
+    post_sql = os.path.join(bench["dir"], "pg_post.sql")
 
+    # 1. Schema + tables (no indexes)
     cmd = PSQL_CMD + ["-f", init_sql]
     r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0:
@@ -472,19 +486,26 @@ def load_data(bench, sf):
     schema = bench["schema"]
     ext = bench["data_ext"]
 
-    for table in bench["tables"]:
-        data_file = os.path.join(data_dir, f"{table}{ext}")
-        if not os.path.exists(data_file):
-            raise RuntimeError(f"Missing data file: {data_file}")
-        copy_sql = (f"\\COPY {schema}.{table} FROM '{data_file}' "
-                    f"WITH (FORMAT csv, DELIMITER '|', NULL '');")
-        psql_run(copy_sql)
+    # 2. Parallel COPY
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {pool.submit(_copy_table, schema, ext, data_dir, t): t
+                for t in bench["tables"]}
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()  # propagate exceptions
 
+    # 3. Create indexes on populated tables (much faster than pre-load)
+    if os.path.exists(post_sql):
+        cmd = PSQL_CMD + ["-f", post_sql]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"pg_post.sql failed:\n{r.stderr.decode()}")
+
+    # 4. ANALYZE
     for table in bench["tables"]:
         psql_run(f"ANALYZE {schema}.{table};")
 
     _loaded[key] = True
-    print("done")
+    print(f"done ({time.time() - t0:.1f}s)")
 
 
 # ============================================================

@@ -1770,9 +1770,11 @@ convert_expression(const substrait::Expression &expr,
         const auto &sq = expr.subquery();
         if (sq.has_scalar())
         {
+            /* Skip CTE dedup inside subqueries: the SubPlan must
+             * read base tables so PG can use indexes (e.g. Q17). */
             Query *subq = build_query_for_rel(
                 &sq.scalar().input(), func_map, nullptr, &schema,
-                rel_cache, depth + 1);
+                nullptr, depth + 1);
 
             SubLink *sl = makeNode(SubLink);
             sl->subLinkType = EXPR_SUBLINK;
@@ -1790,7 +1792,7 @@ convert_expression(const substrait::Expression &expr,
             const auto &sp = sq.set_predicate();
             Query *subq = build_query_for_rel(
                 &sp.tuples(), func_map, nullptr, &schema,
-                rel_cache, depth + 1);
+                nullptr, depth + 1);
 
             SubLink *sl = makeNode(SubLink);
             sl->subLinkType = EXISTS_SUBLINK;
@@ -1808,7 +1810,7 @@ convert_expression(const substrait::Expression &expr,
             const auto &inp = sq.in_predicate();
             Query *subq = build_query_for_rel(
                 &inp.haystack(), func_map, nullptr, &schema,
-                rel_cache, depth + 1);
+                nullptr, depth + 1);
 
             /* Build testexpr: needle = Param(PARAM_SUBLINK) */
             Expr *needle = convert_expression(
