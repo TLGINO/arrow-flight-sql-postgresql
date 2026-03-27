@@ -35,7 +35,7 @@ PSQL_CMD = ["psql", "-h", PGHOST, "-U", PGUSER, "-d", PGDATABASE,
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SF_DIR_MAP = {"0.01": "sf001", "0.1": "sf010", "1": "sf100",
-              "5": "sf500", "10": "sf1000"}
+              "5": "sf500", "10": "sf1000", "15": "sf1500", "20": "sf2000"}
 
 # Features the converter currently handles.
 IMPLEMENTED = {"read", "aggregate", "project", "filter", "sort",
@@ -94,7 +94,7 @@ TPCH_REQUIRES = {
 }
 
 LINEITEM_ROWS = {"0.01": 60175, "0.1": 600572, "1": 6001215,
-                 "5": 29999795, "10": 59986052}
+                 "5": 29999795, "10": 59986052, "15": 89989977, "20": 119994608}
 
 TPCDS_TABLES = [
     "dbgen_version", "customer_address", "customer_demographics",
@@ -113,7 +113,8 @@ TPCDS_ISTHMUS_SKIP = {
     "35": "isthmus: stddev_samp NULL",
 }
 
-STORE_SALES_ROWS = {"0.01": 28810, "0.1": 288464, "1": 2880404}
+STORE_SALES_ROWS = {"0.01": 28810, "0.1": 288464, "1": 2880404,
+                    "5": 14401460, "10": 28800991, "15": 43201221, "20": 57603868}
 
 BENCHMARKS = {
     "tpch": {
@@ -523,13 +524,22 @@ def _has_order_by(bench, qlabel):
         return "order by" in f.read().lower()
 
 
-def run_query(bench, qlabel, explain=False, arrow=False, compare=False):
+def run_query(bench, qlabel, explain=0, arrow=False, compare=False,
+              explain_file=None):
     plans_dir = os.path.join(bench["dir"], "plans")
     plan_file = os.path.join(plans_dir, f"{qlabel}.proto")
     with open(plan_file, "rb") as f:
         plan_bytes = f.read()
 
     ordered = _has_order_by(bench, qlabel)
+
+    # Clean stale adapter explain files before execution
+    if explain & 3:
+        afs_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
+        for stale in ("select_sql.txt", "latest.txt"):
+            p = os.path.join(afs_dir, stale)
+            if os.path.exists(p):
+                os.remove(p)
 
     # Ground truth: psql baseline
     t0 = time.monotonic()
@@ -546,9 +556,18 @@ def run_query(bench, qlabel, explain=False, arrow=False, compare=False):
         arrow_time_s = time.monotonic() - t_arr
         print(f", arrow={arrow_time_s:.3f}s", end="", flush=True)
 
+    # Arrow explain needs Flight SQL execution to trigger adapter SQL explain
+    if explain & 2 and not arrow and not compare:
+        try:
+            ground_truth_pg(bench, qlabel, arrow=True)
+        except Exception as e:
+            print(f" (arrow explain failed: {e})", end="", flush=True)
+
     print(", running substrait...", end=" ", flush=True)
 
-    if explain:
+    explain_parts = []
+
+    if explain & 4:  # pgsql
         pgsql_dir = os.path.join(bench["dir"], "queries", "pgsql")
         query_file = os.path.join(pgsql_dir, f"{qlabel}.sql")
         with open(query_file) as f:
@@ -556,7 +575,7 @@ def run_query(bench, qlabel, explain=False, arrow=False, compare=False):
         explain_out = psql_run(
             f"SET search_path TO {bench['schema']};\n"
             f"EXPLAIN (ANALYZE, FORMAT TEXT) {sql};")
-        print(f"\n  -- PG EXPLAIN (SQL) --\n{explain_out}")
+        explain_parts.append(("PGSQL", explain_out))
 
     if _monitor:
         _monitor.start()
@@ -582,13 +601,31 @@ def run_query(bench, qlabel, explain=False, arrow=False, compare=False):
     if _monitor:
         peak_rss, peak_cpu = _monitor.stop()
 
-    # Read substrait EXPLAIN if available (written by adapter per-query)
-    if explain:
-        explain_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
-        sub_explain_path = os.path.join(explain_dir, "latest.txt")
-        if os.path.exists(sub_explain_path):
-            with open(sub_explain_path) as ef:
-                print(f"\n  -- SUBSTRAIT EXPLAIN --\n{ef.read()}")
+    # Collect adapter explain outputs
+    if explain & 3:
+        afs_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
+        if explain & 2:  # arrow
+            arrow_path = os.path.join(afs_dir, "select_sql.txt")
+            if os.path.exists(arrow_path):
+                with open(arrow_path) as ef:
+                    explain_parts.append(("ARROW", ef.read()))
+        if explain & 1:  # substrait
+            sub_path = os.path.join(afs_dir, "latest.txt")
+            if os.path.exists(sub_path):
+                with open(sub_path) as ef:
+                    explain_parts.append(("SUBSTRAIT", ef.read()))
+
+    # Write combined explain to stdout + file
+    if explain_parts:
+        header = f"\n======== Q{qlabel} ========"
+        print(header)
+        if explain_file:
+            explain_file.write(header + "\n\n")
+        for label, text in explain_parts:
+            section = f"-- {label} --\n{text}"
+            print(section)
+            if explain_file:
+                explain_file.write(section + "\n")
 
     diff_s = substrait_time_s - pg_time_s
     ok, diff = rows_equal(expected, actual, ordered=ordered)
@@ -610,8 +647,8 @@ def run_query(bench, qlabel, explain=False, arrow=False, compare=False):
                         status, pg_time_s, arrow_time_s, substrait_time_s))
 
 
-def run_benchmark(bench, sf, queries=None, explain=False, arrow=False,
-                  compare=False):
+def run_benchmark(bench, sf, queries=None, explain=0, arrow=False,
+                  compare=False, explain_file=None):
     name = bench["schema"].upper()
     requires = bench["requires"]
     skip = bench["skip"]
@@ -653,7 +690,7 @@ def run_benchmark(bench, sf, queries=None, explain=False, arrow=False,
 
         try:
             run_query(bench, qlabel, explain=explain, arrow=arrow,
-                      compare=compare)
+                      compare=compare, explain_file=explain_file)
         except Exception as e:
             print(f"  ERROR: {e}")
             _results["error"] += 1
@@ -670,12 +707,13 @@ def main():
     parser.add_argument("--benchmark", default="tpch",
                         choices=BENCHMARKS.keys(),
                         help="Benchmark to run (default: tpch)")
-    parser.add_argument("--sf", default="0.01", choices=SF_DIR_MAP.keys(),
+    parser.add_argument("--sf", default="0.01",
+                        choices=["0.01", "0.1", "1", "5", "10", "15", "20"],
                         help="Scale factor (default: 0.01)")
     parser.add_argument("--monitor", action="store_true",
                         help="Log peak memory/CPU of PG server per query")
-    parser.add_argument("--explain", action="store_true",
-                        help="Print EXPLAIN ANALYZE for PG ground truth queries")
+    parser.add_argument("--explain", type=int, nargs="?", const=7, default=0,
+                        help="Bitmask: 4=pgsql 2=arrow 1=substrait (default if bare: 7=all)")
     parser.add_argument("--arrow", action="store_true",
                         help="Run ground truth SQL via Flight SQL adapter instead of psql")
     parser.add_argument("--compare", action="store_true",
@@ -707,8 +745,15 @@ def main():
     bench = BENCHMARKS[args.benchmark]
     queries = args.queries or None
 
-    if args.explain or args.compare:
+    if (args.explain & 3) or args.compare:
         os.environ["AFS_EXPLAIN"] = "analyze"
+
+    _explain_file = None
+    if args.explain:
+        explain_dir = os.path.join(SCRIPT_DIR, "explain")
+        os.makedirs(explain_dir, exist_ok=True)
+        _explain_file = open(os.path.join(explain_dir,
+                             f"{args.benchmark}_sf{args.sf}.txt"), "w")
 
     print("Substrait integration tests")
     print("=" * 60)
@@ -721,7 +766,11 @@ def main():
         print("Compare mode: psql + arrow + substrait")
 
     run_benchmark(bench, args.sf, queries, explain=args.explain,
-                  arrow=args.arrow, compare=args.compare)
+                  arrow=args.arrow, compare=args.compare,
+                  explain_file=_explain_file)
+
+    if _explain_file:
+        _explain_file.close()
 
     _stop_flight_helper()
 

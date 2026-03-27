@@ -40,7 +40,11 @@
 /substrait_test/*/data/sf100/
 /substrait_test/*/data/sf500/
 /substrait_test/*/data/sf1000/
+/substrait_test/*/data/sf1500/
+/substrait_test/*/data/sf2000/
+
+
 /scripts/
 __pycache__/
 .claude/
-*.csv
+#*.csv

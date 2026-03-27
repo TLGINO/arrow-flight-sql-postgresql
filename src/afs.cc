@@ -1981,7 +1981,9 @@ class Executor : public WorkerProcessor {
 				std::string explain_sql = (AfsExplainMode >= 2)
 					? "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + query
 					: "EXPLAIN (COSTS, FORMAT TEXT) " + query;
-				auto eres = SPI_execute(explain_sql.c_str(), true, 0);
+				auto eres = SPI_execute(explain_sql.c_str(),
+				AfsExplainMode < 2 /* read_only: plan-only is safe, analyze must execute */,
+				0);
 				if (eres > 0 && SPI_tuptable)
 				{
 					mkdir(AfsExplainDir, 0755);

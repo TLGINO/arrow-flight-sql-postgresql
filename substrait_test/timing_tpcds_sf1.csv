@@ -1,0 +1,2 @@
+sf,query,status,rows,pg_time_s,arrow_time_s,substrait_time_s,sub_pg_ratio
+1,Q39a,FAIL,45000,1.314,,0.927,0.71
