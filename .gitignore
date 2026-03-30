@@ -35,7 +35,7 @@
 .bundle
 .DS_Store
 /substrait_test/explain/
-/substrait_test/monitor_*.csv
+/substrait_test/timing/
 /substrait_test/*/data/sf010/
 /substrait_test/*/data/sf100/
 /substrait_test/*/data/sf500/
@@ -46,5 +46,4 @@
 
 __pycache__/
 .claude/
-/substrait_test/timing_*.csv
 /substrait_test/tpch_performance.png

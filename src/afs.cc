@@ -1981,8 +1981,8 @@ class Executor : public WorkerProcessor {
 			if (AfsExplainMode >= 1)
 			{
 				std::string explain_sql = (AfsExplainMode >= 2)
-					? "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) " + query
-					: "EXPLAIN (COSTS, FORMAT TEXT) " + query;
+					? "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + query
+					: "EXPLAIN (COSTS, FORMAT JSON) " + query;
 				auto eres = SPI_execute(explain_sql.c_str(),
 				AfsExplainMode < 2 /* read_only: plan-only is safe, analyze must execute */,
 				0);
@@ -1990,7 +1990,7 @@ class Executor : public WorkerProcessor {
 				{
 					mkdir(AfsExplainDirGUC, 0755);
 					std::string path =
-						std::string(AfsExplainDirGUC) + "/select_sql.txt";
+						std::string(AfsExplainDirGUC) + "/select_sql.json";
 					std::ofstream out(path);
 					if (out)
 					{
@@ -2133,7 +2133,7 @@ class Executor : public WorkerProcessor {
 				es->buffers = (AfsExplainMode >= 2);
 				es->timing = (AfsExplainMode >= 2);
 				es->summary = true;
-				es->format = EXPLAIN_FORMAT_TEXT;
+				es->format = EXPLAIN_FORMAT_JSON;
 
 				ExplainBeginOutput(es);
 				ExplainOnePlan(pstmt, NULL, es, "<substrait>",
@@ -2142,8 +2142,8 @@ class Executor : public WorkerProcessor {
 
 				mkdir(AfsExplainDirGUC, 0755);
 				/* Write both per-query and latest file */
-				std::string per_query = std::string(AfsExplainDirGUC) + "/" + tag + ".txt";
-				std::string latest = std::string(AfsExplainDirGUC) + "/latest.txt";
+				std::string per_query = std::string(AfsExplainDirGUC) + "/" + tag + ".json";
+				std::string latest = std::string(AfsExplainDirGUC) + "/latest.json";
 				for (auto &path : {per_query, latest})
 				{
 					std::ofstream out(path);

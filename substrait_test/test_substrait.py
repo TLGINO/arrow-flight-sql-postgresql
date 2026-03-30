@@ -17,10 +17,8 @@ import os
 import subprocess
 import sys
 import concurrent.futures
-import threading
 import time
 
-import psutil
 import pyarrow.ipc as ipc
 
 # ============================================================
@@ -233,6 +231,17 @@ def psql_csv(sql, search_path=None):
     return rows
 
 
+def _psql_json(sql):
+    """Run SQL via psql with -tA flags, return raw JSON output."""
+    cmd = PSQL_CMD + ["-t", "-A"]
+    r = subprocess.run(cmd, input=sql.encode(), capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"psql error:\n{r.stderr.decode()}")
+    out = r.stdout.decode().strip()
+    idx = out.find("[")
+    return out[idx:] if idx >= 0 else out
+
+
 # ============================================================
 # Helpers — Flight SQL (single persistent session)
 # ============================================================
@@ -296,93 +305,6 @@ def flight_exec_sql(sql):
 def flight_exec_substrait(plan_bytes):
     proc = _get_flight_helper()
     return _flight_exec(proc, "PLAN", plan_bytes)
-
-
-# ============================================================
-# Resource monitoring (PG server process)
-# ============================================================
-
-_monitor = None
-_monitor_log = []  # list of (qlabel, rows, peak_rss_bytes, peak_cpu, status)
-
-
-def _find_pg_pid():
-    for p in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if p.info["name"] == "postgres":
-                cmd = p.info["cmdline"] or []
-                if any("-D" in a for a in cmd):
-                    return p.info["pid"]
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    return None
-
-
-class ResourceMonitor:
-    def __init__(self, pid):
-        self.proc = psutil.Process(pid)
-        self.ncpus = psutil.cpu_count() or 1
-        self.peak_rss = 0
-        self.peak_cpu = 0.0
-        self.overall_peak_rss = 0
-        self.overall_peak_cpu = 0.0
-        self._running = False
-        self._thread = None
-
-    def start(self):
-        self.peak_rss = 0
-        self.peak_cpu = 0.0
-        self.proc.cpu_percent()  # prime the counter
-        self._running = True
-        self._thread = threading.Thread(target=self._poll, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join()
-        self.overall_peak_rss = max(self.overall_peak_rss, self.peak_rss)
-        self.overall_peak_cpu = max(self.overall_peak_cpu, self.peak_cpu)
-        return self.peak_rss, self.peak_cpu
-
-    def _poll(self):
-        # Keep Process objects alive across polls so cpu_percent() has a
-        # previous measurement to diff against (first call always returns 0).
-        tracked = {}  # pid -> psutil.Process
-        while self._running:
-            try:
-                pids = {self.proc.pid}
-                for c in self.proc.children(recursive=True):
-                    pids.add(c.pid)
-                # add new, remove dead
-                for pid in pids - tracked.keys():
-                    try:
-                        p = psutil.Process(pid)
-                        p.cpu_percent()  # prime
-                        tracked[pid] = p
-                    except psutil.NoSuchProcess:
-                        pass
-                for pid in list(tracked.keys() - pids):
-                    del tracked[pid]
-
-                mem = 0
-                cpu = 0.0
-                for p in tracked.values():
-                    try:
-                        mem += p.memory_info().rss
-                        cpu += p.cpu_percent()
-                    except psutil.NoSuchProcess:
-                        pass
-                cpu /= self.ncpus  # normalize to 0-100%
-                self.peak_rss = max(self.peak_rss, mem)
-                self.peak_cpu = max(self.peak_cpu, cpu)
-            except psutil.NoSuchProcess:
-                break
-            time.sleep(0.1)
-
-
-def _fmt_mb(nbytes):
-    return f"{nbytes / (1024 * 1024):.1f} MB"
 
 
 # ============================================================
@@ -551,7 +473,7 @@ def _has_order_by(bench, qlabel):
         return "order by" in f.read().lower()
 
 
-def run_query(bench, qlabel, run=5, explain=0, explain_file=None):
+def run_query(bench, qlabel, run=5, explain=0, explain_dir=None):
     """Run a query.  run/explain bitmask: 4=pgsql 2=arrow 1=substrait."""
     plans_dir = os.path.join(bench["dir"], "plans")
     plan_file = os.path.join(plans_dir, f"{qlabel}.proto")
@@ -559,12 +481,11 @@ def run_query(bench, qlabel, run=5, explain=0, explain_file=None):
         plan_bytes = f.read()
 
     ordered = _has_order_by(bench, qlabel)
-    effective = run | (explain & 3)  # explain needs execution
 
     # Clean stale adapter explain files
     if explain & 3:
         afs_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
-        for stale in ("select_sql.txt", "latest.txt"):
+        for stale in ("select_sql.json", "latest.json"):
             p = os.path.join(afs_dir, stale)
             if os.path.exists(p):
                 os.remove(p)
@@ -574,14 +495,14 @@ def run_query(bench, qlabel, run=5, explain=0, explain_file=None):
     parts = []  # printed so far
 
     # -- pgsql ground truth (bit 4) --
-    if effective & 4:
+    if run & 4:
         t = time.monotonic()
         expected = ground_truth_pg(bench, qlabel, arrow=False)
         pg_time_s = time.monotonic() - t
         parts.append(f"pg={pg_time_s:.3f}s ({len(expected)} rows)")
 
     # -- arrow ground truth (bit 2) --
-    if effective & 2:
+    if run & 2:
         t = time.monotonic()
         arrow_result = ground_truth_pg(bench, qlabel, arrow=True)
         arrow_time_s = time.monotonic() - t
@@ -599,26 +520,22 @@ def run_query(bench, qlabel, run=5, explain=0, explain_file=None):
         query_file = os.path.join(pgsql_dir, f"{qlabel}.sql")
         with open(query_file) as f:
             sql = f.read().strip().rstrip(";")
-        explain_out = psql_run(
+        explain_out = _psql_json(
             f"SET search_path TO {bench['schema']};\n"
-            f"EXPLAIN (ANALYZE, FORMAT TEXT) {sql};")
-        explain_parts.append(("PGSQL", explain_out))
+            f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql};")
+        explain_parts.append(("pgsql", explain_out))
 
     # -- substrait (bit 1) --
-    if effective & 1:
+    if run & 1:
         sep = ", " if parts else "  "
         print(f"{sep}substrait...", end=" ", flush=True)
 
-        if _monitor:
-            _monitor.start()
         try:
             t = time.monotonic()
             actual = substrait_pg(plan_bytes)
             substrait_time_s = time.monotonic() - t
         except Exception as e:
             substrait_time_s = time.monotonic() - t
-            if _monitor:
-                _monitor.stop()
             print(f"FAIL (adapter error: {e}) sub={substrait_time_s:.3f}s")
             _results["fail"] += 1
             _timing_log.append((qlabel, 0, "FAIL",
@@ -626,33 +543,27 @@ def run_query(bench, qlabel, run=5, explain=0, explain_file=None):
                                 substrait_time_s))
             return
 
-        if _monitor:
-            peak_rss, peak_cpu = _monitor.stop()
-
     # -- collect adapter explain outputs --
     if explain & 3:
         afs_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
         if explain & 2:
-            p = os.path.join(afs_dir, "select_sql.txt")
+            p = os.path.join(afs_dir, "select_sql.json")
             if os.path.exists(p):
                 with open(p) as ef:
-                    explain_parts.append(("ARROW", ef.read()))
+                    explain_parts.append(("arrow", ef.read()))
         if explain & 1:
-            p = os.path.join(afs_dir, "latest.txt")
+            p = os.path.join(afs_dir, "latest.json")
             if os.path.exists(p):
                 with open(p) as ef:
-                    explain_parts.append(("SUBSTRAIT", ef.read()))
+                    explain_parts.append(("substrait", ef.read()))
 
     if explain_parts:
-        header = f"\n======== Q{qlabel} ========"
-        print(header)
-        if explain_file:
-            explain_file.write(header + "\n\n")
-        for label, text in explain_parts:
-            section = f"-- {label} --\n{text}"
-            print(section)
-            if explain_file:
-                explain_file.write(section + "\n")
+        if explain_dir:
+            for label, text in explain_parts:
+                fp = os.path.join(explain_dir, f"Q{qlabel}_{label}.json")
+                with open(fp, "w") as f:
+                    f.write(text)
+            print(", ".join(l for l, _ in explain_parts))
 
     # -- result comparison + reporting --
     nrows = len(actual) if actual is not None else (len(expected) if expected else 0)
@@ -665,26 +576,23 @@ def run_query(bench, qlabel, run=5, explain=0, explain_file=None):
             print(f"PASS {detail}")
         else:
             print(f"FAIL ({diff}) {detail}")
-        if _monitor and (effective & 1):
-            _monitor_log.append((qlabel, nrows, peak_rss, peak_cpu, status,
-                                 pg_time_s, substrait_time_s))
     else:
         status = "PASS"
         _results["pass"] += 1
         times = []
-        if effective & 4:
+        if run & 4:
             times.append(f"pg={pg_time_s:.3f}s")
-        if effective & 1:
+        if run & 1:
             times.append(f"sub={substrait_time_s:.3f}s")
         print(f"OK {' '.join(times)} ({nrows} rows)")
 
     _timing_log.append((qlabel, nrows, status, pg_time_s,
-                        arrow_time_s if (effective & 2) else None,
+                        arrow_time_s if (run & 2) else None,
                         substrait_time_s))
 
 
 def run_benchmark(bench, sf, queries=None, run=5, explain=0,
-                  explain_file=None):
+                  explain_dir=None):
     name = bench["schema"].upper()
     requires = bench["requires"]
     skip = bench["skip"]
@@ -726,7 +634,7 @@ def run_benchmark(bench, sf, queries=None, run=5, explain=0,
 
         try:
             run_query(bench, qlabel, run=run, explain=explain,
-                      explain_file=explain_file)
+                      explain_dir=explain_dir)
         except Exception as e:
             print(f"  ERROR: {e}")
             _results["error"] += 1
@@ -737,8 +645,6 @@ def run_benchmark(bench, sf, queries=None, run=5, explain=0,
 # ============================================================
 
 def main():
-    global _monitor
-
     parser = argparse.ArgumentParser(description="Substrait integration tests")
     parser.add_argument("--benchmark", default="tpch",
                         choices=BENCHMARKS.keys(),
@@ -746,37 +652,32 @@ def main():
     parser.add_argument("--sf", default="0.01",
                         choices=["0.01", "0.1", "1", "5", "10", "15", "20"],
                         help="Scale factor (default: 0.01)")
-    parser.add_argument("--run", type=int, default=5,
+    parser.add_argument("--run", type=int, default=None,
                         help="Bitmask: 4=pgsql 2=arrow 1=substrait (default: 5=pgsql+substrait)")
     parser.add_argument("--explain", type=int, nargs="?", const=7, default=0,
-                        help="Bitmask: 4=pgsql 2=arrow 1=substrait (default if bare: 7=all)")
-    parser.add_argument("--monitor", action="store_true",
-                        help="Log peak memory/CPU of PG server per query")
+                        help="Bitmask: 4=pgsql 2=arrow 1=substrait (sets --run when --run not given)")
     parser.add_argument("queries", nargs="*", type=str,
                         help="query labels to run (default: all)")
     args = parser.parse_args()
 
-    if args.monitor:
-        pg_pid = _find_pg_pid()
-        if pg_pid is None:
-            print("WARNING: could not find PG server process, disabling monitor")
-        else:
-            _monitor = ResourceMonitor(pg_pid)
-            print(f"Monitoring PG server pid={pg_pid}")
-
     bench = BENCHMARKS[args.benchmark]
     queries = args.queries or None
-    run = args.run
+
+    if args.run is not None:
+        run = args.run
+    elif args.explain:
+        run = args.explain
+    else:
+        run = 5
 
     if args.explain & 3:
         psql_run("ALTER SYSTEM SET arrow_flight_sql.explain = 2; SELECT pg_reload_conf();")
 
-    _explain_file = None
+    _explain_dir = None
     if args.explain:
-        explain_dir = os.path.join(SCRIPT_DIR, "explain")
-        os.makedirs(explain_dir, exist_ok=True)
-        _explain_file = open(os.path.join(explain_dir,
-                             f"{args.benchmark}_sf{args.sf}.txt"), "w")
+        _explain_dir = os.path.join(SCRIPT_DIR, "explain",
+                                    f"{args.benchmark}_sf{args.sf}")
+        os.makedirs(_explain_dir, exist_ok=True)
 
     labels = []
     if run & 4: labels.append("pgsql")
@@ -791,10 +692,7 @@ def main():
     print(f"Run: {' + '.join(labels)} ({run})")
 
     run_benchmark(bench, args.sf, queries, run=run,
-                  explain=args.explain, explain_file=_explain_file)
-
-    if _explain_file:
-        _explain_file.close()
+                  explain=args.explain, explain_dir=_explain_dir)
 
     if args.explain & 3:
         psql_run("ALTER SYSTEM RESET arrow_flight_sql.explain; SELECT pg_reload_conf();")
@@ -806,8 +704,8 @@ def main():
     print("\n" + "=" * 60)
     print(f"{p} passed, {f} failed, {s} skipped, {e} errors")
 
-    # Timing comparison table (always printed if we have data)
-    if _timing_log:
+    # Timing comparison table (skip when only explaining)
+    if _timing_log and not args.explain:
         has_arrow = any(t[4] is not None for t in _timing_log)
         if has_arrow:
             print(f"\n{'Query':<8} {'Status':<6} {'Rows':>8} "
@@ -853,7 +751,9 @@ def main():
                       f"{tot_sub/tot_pg:>6.1f}x")
 
         # Write timing CSV
-        csv_path = os.path.join(SCRIPT_DIR,
+        timing_dir = os.path.join(SCRIPT_DIR, "timing")
+        os.makedirs(timing_dir, exist_ok=True)
+        csv_path = os.path.join(timing_dir,
                                 f"timing_{args.benchmark}_sf{args.sf}.csv")
         with open(csv_path, "w", newline="") as cf:
             w = csv.writer(cf)
@@ -867,34 +767,6 @@ def main():
                             f"{arr_t:.3f}" if arr_t else "",
                             f"{sub_t:.3f}", f"{ratio:.2f}"])
         print(f"\nTiming CSV: {csv_path}")
-
-    if _monitor and _monitor_log:
-        csv_path = os.path.join(SCRIPT_DIR,
-                                f"monitor_{args.benchmark}_sf{args.sf}.csv")
-        with open(csv_path, "w", newline="") as cf:
-            w = csv.writer(cf)
-            w.writerow(["sf", "query", "status", "rows",
-                         "peak_rss_mb", "peak_cpu_pct",
-                         "pg_time_s", "substrait_time_s", "diff_s"])
-            for qlabel, rows, rss, cpu, status, pg_t, sub_t in _monitor_log:
-                w.writerow([args.sf, f"Q{qlabel}", status, rows,
-                            f"{rss / (1024*1024):.1f}", f"{cpu:.0f}",
-                            f"{pg_t:.3f}", f"{sub_t:.3f}",
-                            f"{sub_t - pg_t:+.3f}"])
-
-        print(f"\n{'Query':<8} {'Status':<8} {'Rows':>8} "
-              f"{'Peak RSS':>10} {'Peak CPU':>10} "
-              f"{'PG Time':>9} {'Sub Time':>9} {'Diff':>9}")
-        print("-" * 75)
-        for qlabel, rows, rss, cpu, status, pg_t, sub_t in _monitor_log:
-            print(f"Q{qlabel:<7} {status:<8} {rows:>8} "
-                  f"{_fmt_mb(rss):>10} {cpu:>9.0f}% "
-                  f"{pg_t:>8.3f}s {sub_t:>8.3f}s {sub_t - pg_t:>+8.3f}s")
-        print("-" * 75)
-        print(f"{'TOTAL':<8} {'':8} {'':>8} "
-              f"{_fmt_mb(_monitor.overall_peak_rss):>10} "
-              f"{_monitor.overall_peak_cpu:>9.0f}%")
-        print(f"\nCSV written to {csv_path}")
 
     sys.exit(0 if f == 0 and e == 0 else 1)
 
