@@ -1948,13 +1948,13 @@ class Executor : public WorkerProcessor {
 		pgstat_report_activity(STATE_RUNNING, (std::string(Tag) + ": selecting").c_str());
 
 		auto session = find_session();
-		SharedSessionReleaser sessionReleaser(sessions_, session);
 		if (!DsaPointerIsValid(session->selectQuery))
 		{
 			set_error_message(
 				session,
 				std::string(Tag) + ": " + tag_ + ": " + tag + ": query is missing",
 				tag);
+			dshash_release_lock(sessions_, session);
 			return;
 		}
 
@@ -1966,6 +1966,7 @@ class Executor : public WorkerProcessor {
 			dsa_free(area_, session->selectQuery);
 			session->selectQuery = InvalidDsaPointer;
 		}
+		dshash_release_lock(sessions_, session);
 		P("%s: %s: %s: %s", Tag, tag_, tag, query.c_str());
 
 		{
@@ -2015,19 +2016,23 @@ class Executor : public WorkerProcessor {
 				auto status = write_record_batches(tag);
 				if (!status.ok())
 				{
+					auto session = find_session();
 					set_error_message(session,
 					                  std::string(Tag) + ": " + tag_ + ": " + tag +
 					                      ": failed to write: " + status.ToString(),
 					                  tag);
+					dshash_release_lock(sessions_, session);
 				}
 			}
 			else
 			{
+				auto session = find_session();
 				set_error_message(session,
 				                  std::string(Tag) + ": " + tag_ + ": " + tag +
 				                      ": failed to run a query: <" + query +
 				                      ">: " + SPI_result_code_string(result),
 				                  tag);
+				dshash_release_lock(sessions_, session);
 			}
 			SPI_finish();
 			needFinish_ = false;
@@ -2043,7 +2048,6 @@ class Executor : public WorkerProcessor {
 			(std::string(Tag) + ": executing substrait plan").c_str());
 
 		auto session = find_session();
-		SharedSessionReleaser sessionReleaser(sessions_, session);
 		if (!DsaPointerIsValid(session->substraitPlan))
 		{
 			set_error_message(
@@ -2051,6 +2055,7 @@ class Executor : public WorkerProcessor {
 				std::string(Tag) + ": " + tag_ + ": " + tag +
 					": substrait plan is missing",
 				tag);
+			dshash_release_lock(sessions_, session);
 			return;
 		}
 
@@ -2062,7 +2067,11 @@ class Executor : public WorkerProcessor {
 				dsa_get_address(area_, session->substraitPlan));
 			planSize = session->substraitPlanSize;
 			planCopy.assign(planData, planData + planSize);
+			dsa_free(area_, session->substraitPlan);
+			session->substraitPlan = InvalidDsaPointer;
+			session->substraitPlanSize = 0;
 		}
+		dshash_release_lock(sessions_, session);
 
 		P("%s: %s: %s: plan size: %" PRIsize, Tag, tag_, tag, planSize);
 
@@ -2104,7 +2113,8 @@ class Executor : public WorkerProcessor {
 				PGC_USERSET, PGC_S_SESSION,
 				GUC_ACTION_LOCAL, true, ERROR, false);
 
-			PlannedStmt* pstmt = standard_planner(query, "<substrait>", 0, NULL);
+			PlannedStmt* pstmt = standard_planner(query, "<substrait>",
+				CURSOR_OPT_PARALLEL_OK, NULL);
 
 #ifdef AFS_DEBUG
 			clock_gettime(CLOCK_MONOTONIC, &ts2);
@@ -2161,11 +2171,13 @@ class Executor : public WorkerProcessor {
 			auto status = write_empty_schema_streaming(tag, tupdesc);
 			if (!status.ok())
 			{
+				auto session = find_session();
 				set_error_message(
 					session,
 					std::string(Tag) + ": " + tag_ + ": " + tag +
 						": failed to write schema: " + status.ToString(),
 					tag);
+				dshash_release_lock(sessions_, session);
 			}
 		}
 		else
@@ -2173,14 +2185,16 @@ class Executor : public WorkerProcessor {
 			pgstat_report_activity(
 				STATE_RUNNING,
 				(std::string(Tag) + ": " + tag + ": writing").c_str());
-		auto status = write_record_batches_streaming(tag, tupdesc, qdesc);
+			auto status = write_record_batches_streaming(tag, tupdesc, qdesc);
 			if (!status.ok())
 			{
+				auto session = find_session();
 				set_error_message(
 					session,
 					std::string(Tag) + ": " + tag_ + ": " + tag +
 						": failed to write: " + status.ToString(),
 					tag);
+				dshash_release_lock(sessions_, session);
 			}
 
 #ifdef AFS_DEBUG
@@ -2198,34 +2212,17 @@ class Executor : public WorkerProcessor {
 			PopActiveSnapshot();
 			FreeQueryDesc(qdesc);
 
-			// Free the shared memory plan data
-			{
-				ProcessorLockGuard lock(this);
-				dsa_free(area_, session->substraitPlan);
-				session->substraitPlan = InvalidDsaPointer;
-				session->substraitPlanSize = 0;
-			}
-
 			signal_server(tag);
 		}
 		catch (const std::bad_alloc& e)
 		{
+			auto session = find_session();
 			set_error_message(
 				session,
 				std::string(Tag) + ": " + tag_ + ": " + tag +
 					": out of memory: " + e.what(),
 				tag);
-
-			// Free the shared memory plan data
-			{
-				ProcessorLockGuard lock(this);
-				if (session->substraitPlan != InvalidDsaPointer)
-				{
-					dsa_free(area_, session->substraitPlan);
-					session->substraitPlan = InvalidDsaPointer;
-					session->substraitPlanSize = 0;
-				}
-			}
+			dshash_release_lock(sessions_, session);
 
 			signal_server(tag);
 		}
@@ -2405,6 +2402,17 @@ class Executor : public WorkerProcessor {
 		uint64_t nRowsInBatch = 0;
 		uint64_t totalRows = 0;
 
+		// ExecProcNode bypasses ExecutorRun, so we must manually:
+		// 1. Set es_use_parallel_mode — Gather node checks this flag
+		//    (nodeGather.c:160) before launching workers
+		// 2. Call EnterParallelMode — InitializeParallelDSM asserts this
+		bool useParallel = qdesc->plannedstmt->parallelModeNeeded;
+		if (useParallel)
+		{
+			qdesc->estate->es_use_parallel_mode = true;
+			EnterParallelMode();
+		}
+
 		// Fine-grained timing (always-on, minimal overhead)
 		struct timespec t_fetch_start, t_fetch_end, t_append_end;
 		double fetch_ns = 0, append_ns = 0, ipc_ns = 0;
@@ -2460,6 +2468,9 @@ class Executor : public WorkerProcessor {
 			         + (t_ipc_end.tv_nsec - t_ipc_start.tv_nsec);
 			totalRows += nRowsInBatch;
 		}
+
+		if (useParallel)
+			ExitParallelMode();
 
 		elog(LOG, "AFS_PERF %s: streaming %" PRIu64 " rows: "
 			"fetch=%.1f ms, arrow_append=%.1f ms, ipc_write=%.1f ms",
@@ -2775,21 +2786,13 @@ SharedRingBufferOutputStream::Write(const void* data, int64_t nBytes)
 			ARROW_ASSIGN_OR_RAISE(
 				auto writtenBytes,
 				processor_->write(localSession_.get(), &buffer, data, rest));
-			if (INTERRUPTS_PENDING_CONDITION())
-			{
-				return arrow::Status::IOError(std::string(Tag) + ": " +
-				                              processor_->tag() + ": interrupted");
-			}
+			CHECK_FOR_INTERRUPTS();
 
 			if (writtenBytes == 0)
 			{
 				ARROW_RETURN_NOT_OK(processor_->wait(
 					localSession_.get(), &buffer, Processor::WaitMode::Read));
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return arrow::Status::IOError(std::string(Tag) + ": " +
-					                              processor_->tag() + ": interrupted");
-				}
+				CHECK_FOR_INTERRUPTS();
 				continue;
 			}
 
@@ -3092,10 +3095,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		return id;
 	}
 
@@ -3245,10 +3245,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		P("%s: %s: %s: open", Tag, tag_, tag);
 		auto schema = read_schema(localSession, tag);
 		P("%s: %s: %s: schema", Tag, tag_, tag);
@@ -3283,10 +3280,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		P("%s: %s: %s: open", Tag, tag_, tag);
 		auto schema = read_schema(localSession, tag);
 		P("%s: %s: %s: schema", Tag, tag_, tag);
@@ -3400,10 +3394,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		P("%s: %s: %s: done: %" PRIu64, Tag, tag_, tag, request->nUpdatedRecords);
 		return request->nUpdatedRecords;
 	}
@@ -3518,10 +3509,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		arrow::flight::sql::ActionCreatePreparedStatementResult result = {
 			nullptr,
 			nullptr,
@@ -3638,10 +3626,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		P("%s: %s: %s: done", Tag, tag_, tag);
 		return arrow::Status::OK();
 	}
@@ -3776,10 +3761,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		P("%s: %s: %s: done", Tag, tag_, tag);
 		return arrow::Status::OK();
 	}
@@ -3861,10 +3843,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		P("%s: %s: %s: open", Tag, tag_, tag);
 		auto schema = read_schema(localSession, tag);
 		P("%s: %s: %s: schema", Tag, tag_, tag);
@@ -4006,10 +3985,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		P("%s: %s: %s: done: %" PRIu64, Tag, tag_, tag, request->nUpdatedRecords);
 		return request->nUpdatedRecords;
 	}
@@ -4090,10 +4066,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::IOError("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		return request->readBytes;
 	}
 
@@ -4188,10 +4161,7 @@ class Proxy : public WorkerProcessor {
 			});
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::IOError("interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		return request->writtenBytes;
 	}
 
@@ -4266,10 +4236,7 @@ class Proxy : public WorkerProcessor {
 			return get_waiting_buffer_size(buffer, mode) > 0;
 		});
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession, true));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::Invalid(tag_, ": ", tag, ": ", "interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 		return arrow::Status::OK();
 	}
 };
@@ -4289,21 +4256,13 @@ SharedRingBufferInputStream::Read(int64_t nBytes, void* out)
 	{
 		ARROW_ASSIGN_OR_RAISE(auto readBytes,
 		                      processor_->read(localSession_.get(), &buffer, rest, out));
-		if (INTERRUPTS_PENDING_CONDITION())
-		{
-			return arrow::Status::IOError(std::string(Tag) + ": " + processor_->tag() +
-			                              ": interrupted");
-		}
+		CHECK_FOR_INTERRUPTS();
 
 		if (readBytes == 0)
 		{
 			ARROW_RETURN_NOT_OK(processor_->wait(
 				localSession_.get(), &buffer, Processor::WaitMode::Written));
-			if (INTERRUPTS_PENDING_CONDITION())
-			{
-				return arrow::Status::IOError(std::string(Tag) + ": " +
-				                              processor_->tag() + ": interrupted");
-			}
+			CHECK_FOR_INTERRUPTS();
 			continue;
 		}
 
