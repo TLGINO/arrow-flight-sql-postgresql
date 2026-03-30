@@ -1,7 +1,7 @@
 DROP SCHEMA IF EXISTS tpch CASCADE;
 CREATE SCHEMA tpch;
 
-CREATE TABLE tpch.customer (
+CREATE UNLOGGED TABLE tpch.customer (
   c_custkey BIGINT,
   c_name VARCHAR(25),
   c_address VARCHAR(40),
@@ -12,7 +12,7 @@ CREATE TABLE tpch.customer (
   c_comment VARCHAR(117)
 );
 
-CREATE TABLE tpch.lineitem (
+CREATE UNLOGGED TABLE tpch.lineitem (
   l_orderkey BIGINT,
   l_partkey BIGINT,
   l_suppkey BIGINT,
@@ -31,14 +31,14 @@ CREATE TABLE tpch.lineitem (
   l_comment VARCHAR(44)
 );
 
-CREATE TABLE tpch.nation (
+CREATE UNLOGGED TABLE tpch.nation (
   n_nationkey BIGINT,
   n_name CHAR(25),
   n_regionkey BIGINT,
   n_comment VARCHAR(152)
 );
 
-CREATE TABLE tpch.orders (
+CREATE UNLOGGED TABLE tpch.orders (
   o_orderkey BIGINT,
   o_custkey BIGINT,
   o_orderstatus CHAR(1),
@@ -50,7 +50,7 @@ CREATE TABLE tpch.orders (
   o_comment VARCHAR(79)
 );
 
-CREATE TABLE tpch.part (
+CREATE UNLOGGED TABLE tpch.part (
   p_partkey BIGINT,
   p_name VARCHAR(55),
   p_mfgr CHAR(25),
@@ -62,7 +62,7 @@ CREATE TABLE tpch.part (
   p_comment VARCHAR(23)
 );
 
-CREATE TABLE tpch.partsupp (
+CREATE UNLOGGED TABLE tpch.partsupp (
   ps_partkey BIGINT,
   ps_suppkey BIGINT,
   ps_availqty INTEGER,
@@ -70,13 +70,13 @@ CREATE TABLE tpch.partsupp (
   ps_comment VARCHAR(199)
 );
 
-CREATE TABLE tpch.region (
+CREATE UNLOGGED TABLE tpch.region (
   r_regionkey BIGINT,
   r_name CHAR(25),
   r_comment VARCHAR(152)
 );
 
-CREATE TABLE tpch.supplier (
+CREATE UNLOGGED TABLE tpch.supplier (
   s_suppkey BIGINT,
   s_name CHAR(25),
   s_address VARCHAR(40),

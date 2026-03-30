@@ -1,7 +1,0 @@
-sf,query,status,rows,pg_time_s,arrow_time_s,substrait_time_s,sub_pg_ratio
-10,Q01,PASS,4,14.334,,65.261,4.55
-10,Q03,PASS,10,5.307,,19.370,3.65
-10,Q05,PASS,5,4.869,,15.833,3.25
-10,Q06,PASS,1,3.468,,7.667,2.21
-10,Q09,PASS,175,22.651,,80.209,3.54
-10,Q18,PASS,100,23.072,,63.452,2.75

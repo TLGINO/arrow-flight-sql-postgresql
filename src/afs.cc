@@ -134,10 +134,11 @@ static int SessionTimeout;
 static const int MaxNRowsPerRecordBatchDefault = 1 * 1024 * 1024;
 static int MaxNRowsPerRecordBatch;
 
-// AFS_EXPLAIN=analyze: log EXPLAIN ANALYZE for each Substrait query
-// 0=off, 1=plan-only (no execution), 2=analyze (full execution)
+// Explain mode: 0=off, 1=plan-only, 2=analyze (full execution)
+// Controlled via arrow_flight_sql.explain GUC or AFS_EXPLAIN env var fallback
 static int AfsExplainMode = 0;
-static const char* AfsExplainDir = "/tmp/afs_explain";
+static char* AfsExplainDirGUC = NULL;
+static const char* AfsExplainDirDefault = "/tmp/afs_explain";
 
 static volatile sig_atomic_t GotSIGTERM = false;
 void
@@ -1987,9 +1988,9 @@ class Executor : public WorkerProcessor {
 				0);
 				if (eres > 0 && SPI_tuptable)
 				{
-					mkdir(AfsExplainDir, 0755);
+					mkdir(AfsExplainDirGUC, 0755);
 					std::string path =
-						std::string(AfsExplainDir) + "/select_sql.txt";
+						std::string(AfsExplainDirGUC) + "/select_sql.txt";
 					std::ofstream out(path);
 					if (out)
 					{
@@ -2139,10 +2140,10 @@ class Executor : public WorkerProcessor {
 				               NULL, NULL, NULL, NULL, NULL);
 				ExplainEndOutput(es);
 
-				mkdir(AfsExplainDir, 0755);
+				mkdir(AfsExplainDirGUC, 0755);
 				/* Write both per-query and latest file */
-				std::string per_query = std::string(AfsExplainDir) + "/" + tag + ".txt";
-				std::string latest = std::string(AfsExplainDir) + "/latest.txt";
+				std::string per_query = std::string(AfsExplainDirGUC) + "/" + tag + ".txt";
+				std::string latest = std::string(AfsExplainDirGUC) + "/latest.txt";
 				for (auto &path : {per_query, latest})
 				{
 					std::ofstream out(path);
@@ -4791,16 +4792,20 @@ afs_executor(Datum arg)
 #endif
 	BackgroundWorkerUnblockSignals();
 
-	// Check AFS_EXPLAIN env var
+	// Explain: GUC takes precedence, env var as fallback
+	if (AfsExplainMode == 0)
 	{
 		const char* explain = getenv("AFS_EXPLAIN");
 		if (explain && strcmp(explain, "plan") == 0)
 			AfsExplainMode = 1;
 		else if (explain && strcmp(explain, "analyze") == 0)
 			AfsExplainMode = 2;
+	}
+	{
 		const char* dir = getenv("AFS_EXPLAIN_DIR");
-		if (dir)
-			AfsExplainDir = dir;
+		if (dir && (!AfsExplainDirGUC ||
+		    strcmp(AfsExplainDirGUC, AfsExplainDirDefault) == 0))
+			AfsExplainDirGUC = pstrdup(dir);
 	}
 
 	auto executor = new Executor(DatumGetInt64(arg));
@@ -4945,6 +4950,30 @@ _PG_init(void)
 	                        NULL,
 	                        NULL,
 	                        NULL);
+
+	DefineCustomIntVariable("arrow_flight_sql.explain",
+	                        "Explain mode for Substrait/SQL queries.",
+	                        "0=off, 1=plan only, 2=analyze (with execution).",
+	                        &AfsExplainMode,
+	                        0,
+	                        0,
+	                        2,
+	                        PGC_SIGHUP,
+	                        0,
+	                        NULL,
+	                        NULL,
+	                        NULL);
+
+	DefineCustomStringVariable("arrow_flight_sql.explain_dir",
+	                           "Directory for explain output files.",
+	                           "default: /tmp/afs_explain",
+	                           &AfsExplainDirGUC,
+	                           AfsExplainDirDefault,
+	                           PGC_SIGHUP,
+	                           0,
+	                           NULL,
+	                           NULL,
+	                           NULL);
 
 	DefineCustomIntVariable("arrow_flight_sql.max_n_rows_per_record_batch",
 	                        "The maximum number of rows per record batch.",

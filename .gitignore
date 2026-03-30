@@ -44,7 +44,7 @@
 /substrait_test/*/data/sf2000/
 
 
-/scripts/
 __pycache__/
 .claude/
-#*.csv
+/substrait_test/timing_*.csv
+/substrait_test/tpch_performance.png

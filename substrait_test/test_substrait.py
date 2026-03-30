@@ -2,10 +2,12 @@
 """
 Substrait integration tests — TPC-H and TPC-DS.
 
-Ground truth: SQL on PostgreSQL via psql.
-Substrait execution: PG Flight SQL adapter.
+Run:   python3 substrait_test/test_substrait.py [--run N] [--explain N] [--sf SF] [query_labels...]
 
-Run:   python3 substrait_test/test_substrait.py [--benchmark tpch|tpcds] [--sf SF] [query_labels...]
+--run N      bitmask: 4=pgsql 2=arrow 1=substrait  (default 5 = pgsql+substrait)
+--explain N  bitmask: 4=pgsql 2=arrow 1=substrait  (default if bare: 7=all)
+
+Common: --run 1  substrait only | --run 5  pgsql+substrait | --run 7  all three
 """
 
 import argparse
@@ -448,13 +450,38 @@ def _ensure_search_path(bench):
     psql_run(f"ALTER DATABASE postgres SET search_path TO public, {schema};")
 
 
+def _create_indexes_parallel(post_sql, schema):
+    """Run each CREATE INDEX statement in parallel."""
+    with open(post_sql) as f:
+        stmts = []
+        for line in f:
+            line = line.strip()
+            if line.upper().startswith("CREATE INDEX") or line.upper().startswith("CREATE UNIQUE INDEX"):
+                stmts.append(line)
+            elif line.upper().startswith("SET "):
+                # Apply SET statements (e.g. maintenance_work_mem) per-session
+                pass  # will prepend to each worker
+    # Prepend maintenance_work_mem to each statement
+    prefix = "SET maintenance_work_mem = '1GB'; "
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(psql_run, prefix + stmt) for stmt in stmts]
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
+    # Run non-index statements (ALTER DATABASE etc.) serially
+    with open(post_sql) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("--") and not line.upper().startswith(("CREATE INDEX", "CREATE UNIQUE INDEX", "SET ")):
+                psql_run(line)
+
+
 def _copy_table(schema, ext, data_dir, table):
     """COPY a single table — called from thread pool."""
-    data_file = os.path.join(data_dir, f"{table}{ext}")
+    data_file = os.path.abspath(os.path.join(data_dir, f"{table}{ext}"))
     if not os.path.exists(data_file):
         raise RuntimeError(f"Missing data file: {data_file}")
-    copy_sql = (f"\\COPY {schema}.{table} FROM '{data_file}' "
-                f"WITH (FORMAT csv, DELIMITER '|', NULL '');")
+    copy_sql = (f"COPY {schema}.{table} FROM '{data_file}' "
+                f"WITH (FORMAT text, DELIMITER '|', NULL '');")
     psql_run(copy_sql)
 
 
@@ -487,23 +514,23 @@ def load_data(bench, sf):
     schema = bench["schema"]
     ext = bench["data_ext"]
 
-    # 2. Parallel COPY
+    # 2. Parallel COPY (tables are UNLOGGED — no WAL overhead)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         futs = {pool.submit(_copy_table, schema, ext, data_dir, t): t
                 for t in bench["tables"]}
         for fut in concurrent.futures.as_completed(futs):
             fut.result()  # propagate exceptions
 
-    # 3. Create indexes on populated tables (much faster than pre-load)
+    # 3. Create indexes in parallel
     if os.path.exists(post_sql):
-        cmd = PSQL_CMD + ["-f", post_sql]
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"pg_post.sql failed:\n{r.stderr.decode()}")
+        _create_indexes_parallel(post_sql, schema)
 
-    # 4. ANALYZE
-    for table in bench["tables"]:
-        psql_run(f"ANALYZE {schema}.{table};")
+    # 4. Parallel ANALYZE
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(psql_run, f"ANALYZE {schema}.{table};")
+                for table in bench["tables"]]
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
 
     _loaded[key] = True
     print(f"done ({time.time() - t0:.1f}s)")
@@ -524,16 +551,17 @@ def _has_order_by(bench, qlabel):
         return "order by" in f.read().lower()
 
 
-def run_query(bench, qlabel, explain=0, arrow=False, compare=False,
-              explain_file=None):
+def run_query(bench, qlabel, run=5, explain=0, explain_file=None):
+    """Run a query.  run/explain bitmask: 4=pgsql 2=arrow 1=substrait."""
     plans_dir = os.path.join(bench["dir"], "plans")
     plan_file = os.path.join(plans_dir, f"{qlabel}.proto")
     with open(plan_file, "rb") as f:
         plan_bytes = f.read()
 
     ordered = _has_order_by(bench, qlabel)
+    effective = run | (explain & 3)  # explain needs execution
 
-    # Clean stale adapter explain files before execution
+    # Clean stale adapter explain files
     if explain & 3:
         afs_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
         for stale in ("select_sql.txt", "latest.txt"):
@@ -541,33 +569,32 @@ def run_query(bench, qlabel, explain=0, arrow=False, compare=False,
             if os.path.exists(p):
                 os.remove(p)
 
-    # Ground truth: psql baseline
-    t0 = time.monotonic()
-    expected = ground_truth_pg(bench, qlabel, arrow=arrow)
-    pg_time_s = time.monotonic() - t0
-    gt_label = "arrow" if arrow else "pg"
-    print(f"  {gt_label}={pg_time_s:.3f}s ({len(expected)} rows)", end="", flush=True)
+    pg_time_s = arrow_time_s = substrait_time_s = 0.0
+    expected = actual = None
+    parts = []  # printed so far
 
-    # Compare mode: also run Flight SQL (arrow) ground truth
-    arrow_time_s = None
-    if compare and not arrow:
-        t_arr = time.monotonic()
-        ground_truth_pg(bench, qlabel, arrow=True)
-        arrow_time_s = time.monotonic() - t_arr
-        print(f", arrow={arrow_time_s:.3f}s", end="", flush=True)
+    # -- pgsql ground truth (bit 4) --
+    if effective & 4:
+        t = time.monotonic()
+        expected = ground_truth_pg(bench, qlabel, arrow=False)
+        pg_time_s = time.monotonic() - t
+        parts.append(f"pg={pg_time_s:.3f}s ({len(expected)} rows)")
 
-    # Arrow explain needs Flight SQL execution to trigger adapter SQL explain
-    if explain & 2 and not arrow and not compare:
-        try:
-            ground_truth_pg(bench, qlabel, arrow=True)
-        except Exception as e:
-            print(f" (arrow explain failed: {e})", end="", flush=True)
+    # -- arrow ground truth (bit 2) --
+    if effective & 2:
+        t = time.monotonic()
+        arrow_result = ground_truth_pg(bench, qlabel, arrow=True)
+        arrow_time_s = time.monotonic() - t
+        if expected is None:
+            expected = arrow_result
+        parts.append(f"arrow={arrow_time_s:.3f}s")
 
-    print(", running substrait...", end=" ", flush=True)
+    if parts:
+        print(f"  {', '.join(parts)}", end="", flush=True)
 
+    # -- pgsql EXPLAIN ANALYZE (bit 4 of explain) --
     explain_parts = []
-
-    if explain & 4:  # pgsql
+    if explain & 4:
         pgsql_dir = os.path.join(bench["dir"], "queries", "pgsql")
         query_file = os.path.join(pgsql_dir, f"{qlabel}.sql")
         with open(query_file) as f:
@@ -577,45 +604,45 @@ def run_query(bench, qlabel, explain=0, arrow=False, compare=False,
             f"EXPLAIN (ANALYZE, FORMAT TEXT) {sql};")
         explain_parts.append(("PGSQL", explain_out))
 
-    if _monitor:
-        _monitor.start()
-    try:
-        t1 = time.monotonic()
-        actual = substrait_pg(plan_bytes)
-        substrait_time_s = time.monotonic() - t1
-    except Exception as e:
-        substrait_time_s = time.monotonic() - t1
+    # -- substrait (bit 1) --
+    if effective & 1:
+        sep = ", " if parts else "  "
+        print(f"{sep}substrait...", end=" ", flush=True)
+
+        if _monitor:
+            _monitor.start()
+        try:
+            t = time.monotonic()
+            actual = substrait_pg(plan_bytes)
+            substrait_time_s = time.monotonic() - t
+        except Exception as e:
+            substrait_time_s = time.monotonic() - t
+            if _monitor:
+                _monitor.stop()
+            print(f"FAIL (adapter error: {e}) sub={substrait_time_s:.3f}s")
+            _results["fail"] += 1
+            _timing_log.append((qlabel, 0, "FAIL",
+                                pg_time_s, arrow_time_s or None,
+                                substrait_time_s))
+            return
+
         if _monitor:
             peak_rss, peak_cpu = _monitor.stop()
-            _monitor_log.append((qlabel, 0, peak_rss, peak_cpu, "FAIL",
-                                 pg_time_s, substrait_time_s))
-        diff_s = substrait_time_s - pg_time_s
-        print(f"FAIL (adapter error: {e}) "
-              f"sub={substrait_time_s:.3f}s diff={diff_s:+.3f}s")
-        _results["fail"] += 1
-        _timing_log.append((qlabel, 0, "FAIL", pg_time_s, arrow_time_s,
-                            substrait_time_s))
-        return
 
-    peak_rss = peak_cpu = 0
-    if _monitor:
-        peak_rss, peak_cpu = _monitor.stop()
-
-    # Collect adapter explain outputs
+    # -- collect adapter explain outputs --
     if explain & 3:
         afs_dir = os.environ.get("AFS_EXPLAIN_DIR", "/tmp/afs_explain")
-        if explain & 2:  # arrow
-            arrow_path = os.path.join(afs_dir, "select_sql.txt")
-            if os.path.exists(arrow_path):
-                with open(arrow_path) as ef:
+        if explain & 2:
+            p = os.path.join(afs_dir, "select_sql.txt")
+            if os.path.exists(p):
+                with open(p) as ef:
                     explain_parts.append(("ARROW", ef.read()))
-        if explain & 1:  # substrait
-            sub_path = os.path.join(afs_dir, "latest.txt")
-            if os.path.exists(sub_path):
-                with open(sub_path) as ef:
+        if explain & 1:
+            p = os.path.join(afs_dir, "latest.txt")
+            if os.path.exists(p):
+                with open(p) as ef:
                     explain_parts.append(("SUBSTRAIT", ef.read()))
 
-    # Write combined explain to stdout + file
     if explain_parts:
         header = f"\n======== Q{qlabel} ========"
         print(header)
@@ -627,28 +654,37 @@ def run_query(bench, qlabel, explain=0, arrow=False, compare=False,
             if explain_file:
                 explain_file.write(section + "\n")
 
-    diff_s = substrait_time_s - pg_time_s
-    ok, diff = rows_equal(expected, actual, ordered=ordered)
-    status = "PASS" if ok else "FAIL"
-    if ok:
-        print(f"PASS sub={substrait_time_s:.3f}s diff={diff_s:+.3f}s")
-        _results["pass"] += 1
-        if _monitor:
-            _monitor_log.append((qlabel, len(expected), peak_rss, peak_cpu, "PASS",
+    # -- result comparison + reporting --
+    nrows = len(actual) if actual is not None else (len(expected) if expected else 0)
+    if expected is not None and actual is not None:
+        ok, diff = rows_equal(expected, actual, ordered=ordered)
+        status = "PASS" if ok else "FAIL"
+        _results["pass" if ok else "fail"] += 1
+        detail = f"sub={substrait_time_s:.3f}s diff={substrait_time_s - pg_time_s:+.3f}s"
+        if ok:
+            print(f"PASS {detail}")
+        else:
+            print(f"FAIL ({diff}) {detail}")
+        if _monitor and (effective & 1):
+            _monitor_log.append((qlabel, nrows, peak_rss, peak_cpu, status,
                                  pg_time_s, substrait_time_s))
     else:
-        print(f"FAIL ({diff}) sub={substrait_time_s:.3f}s diff={diff_s:+.3f}s")
-        _results["fail"] += 1
-        if _monitor:
-            _monitor_log.append((qlabel, len(expected), peak_rss, peak_cpu, "FAIL",
-                                 pg_time_s, substrait_time_s))
+        status = "PASS"
+        _results["pass"] += 1
+        times = []
+        if effective & 4:
+            times.append(f"pg={pg_time_s:.3f}s")
+        if effective & 1:
+            times.append(f"sub={substrait_time_s:.3f}s")
+        print(f"OK {' '.join(times)} ({nrows} rows)")
 
-    _timing_log.append((qlabel, len(expected) if ok else len(actual),
-                        status, pg_time_s, arrow_time_s, substrait_time_s))
+    _timing_log.append((qlabel, nrows, status, pg_time_s,
+                        arrow_time_s if (effective & 2) else None,
+                        substrait_time_s))
 
 
-def run_benchmark(bench, sf, queries=None, explain=0, arrow=False,
-                  compare=False, explain_file=None):
+def run_benchmark(bench, sf, queries=None, run=5, explain=0,
+                  explain_file=None):
     name = bench["schema"].upper()
     requires = bench["requires"]
     skip = bench["skip"]
@@ -689,8 +725,8 @@ def run_benchmark(bench, sf, queries=None, explain=0, arrow=False,
             continue
 
         try:
-            run_query(bench, qlabel, explain=explain, arrow=arrow,
-                      compare=compare, explain_file=explain_file)
+            run_query(bench, qlabel, run=run, explain=explain,
+                      explain_file=explain_file)
         except Exception as e:
             print(f"  ERROR: {e}")
             _results["error"] += 1
@@ -710,29 +746,15 @@ def main():
     parser.add_argument("--sf", default="0.01",
                         choices=["0.01", "0.1", "1", "5", "10", "15", "20"],
                         help="Scale factor (default: 0.01)")
-    parser.add_argument("--monitor", action="store_true",
-                        help="Log peak memory/CPU of PG server per query")
+    parser.add_argument("--run", type=int, default=5,
+                        help="Bitmask: 4=pgsql 2=arrow 1=substrait (default: 5=pgsql+substrait)")
     parser.add_argument("--explain", type=int, nargs="?", const=7, default=0,
                         help="Bitmask: 4=pgsql 2=arrow 1=substrait (default if bare: 7=all)")
-    parser.add_argument("--arrow", action="store_true",
-                        help="Run ground truth SQL via Flight SQL adapter instead of psql")
-    parser.add_argument("--compare", action="store_true",
-                        help="Run psql + arrow + substrait, print comparison table")
-    parser.add_argument("--background", action="store_true",
-                        help="Daemonize and write output to output.txt")
+    parser.add_argument("--monitor", action="store_true",
+                        help="Log peak memory/CPU of PG server per query")
     parser.add_argument("queries", nargs="*", type=str,
                         help="query labels to run (default: all)")
     args = parser.parse_args()
-
-    if args.background:
-        pid = os.fork()
-        if pid > 0:
-            print(f"Backgrounded (pid={pid}), output -> output.txt")
-            sys.exit(0)
-        os.setsid()
-        out = open("output.txt", "w", buffering=1)  # line-buffered
-        sys.stdout = out
-        sys.stderr = out
 
     if args.monitor:
         pg_pid = _find_pg_pid()
@@ -744,9 +766,10 @@ def main():
 
     bench = BENCHMARKS[args.benchmark]
     queries = args.queries or None
+    run = args.run
 
-    if (args.explain & 3) or args.compare:
-        os.environ["AFS_EXPLAIN"] = "analyze"
+    if args.explain & 3:
+        psql_run("ALTER SYSTEM SET arrow_flight_sql.explain = 2; SELECT pg_reload_conf();")
 
     _explain_file = None
     if args.explain:
@@ -755,22 +778,26 @@ def main():
         _explain_file = open(os.path.join(explain_dir,
                              f"{args.benchmark}_sf{args.sf}.txt"), "w")
 
+    labels = []
+    if run & 4: labels.append("pgsql")
+    if run & 2: labels.append("arrow")
+    if run & 1: labels.append("substrait")
+
     print("Substrait integration tests")
     print("=" * 60)
     print(f"Benchmark: {args.benchmark}")
     print(f"Implemented: {sorted(IMPLEMENTED)}")
     print(f"Scale factor: {args.sf}")
-    if args.arrow:
-        print("Ground truth: Flight SQL (--arrow)")
-    if args.compare:
-        print("Compare mode: psql + arrow + substrait")
+    print(f"Run: {' + '.join(labels)} ({run})")
 
-    run_benchmark(bench, args.sf, queries, explain=args.explain,
-                  arrow=args.arrow, compare=args.compare,
-                  explain_file=_explain_file)
+    run_benchmark(bench, args.sf, queries, run=run,
+                  explain=args.explain, explain_file=_explain_file)
 
     if _explain_file:
         _explain_file.close()
+
+    if args.explain & 3:
+        psql_run("ALTER SYSTEM RESET arrow_flight_sql.explain; SELECT pg_reload_conf();")
 
     _stop_flight_helper()
 

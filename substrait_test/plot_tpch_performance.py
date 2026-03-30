@@ -14,8 +14,7 @@ from pathlib import Path
 
 # Configuration
 SCRIPT_DIR = Path(__file__).parent
-SUBSTRAIT_TEST_DIR = SCRIPT_DIR / "substrait_test"
-QUERIES = ["Q01", "Q03", "Q05", "Q06", "Q09", "Q18"]
+SUBSTRAIT_TEST_DIR = SCRIPT_DIR
 SCALE_FACTORS = [0.01, 0.1, 1, 5, 10, 15, 20]
 
 def load_tpch_data():
@@ -38,14 +37,22 @@ def load_tpch_data():
 
 def plot_tpch_performance(data, output_file="tpch_performance.png"):
     """
-    Create a 2x3 grid of plots, one for each TPC-H query.
-    Each plot shows 3 curves: PostgreSQL, Arrow Flight SQL, and Substrait execution times.
+    Create a grid of plots, one for each TPC-H query found in the data.
+    Each plot shows curves for PostgreSQL, Arrow Flight SQL, and Substrait execution times.
     """
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    import math
+    queries = sorted(data['query'].unique())
+    n = len(queries)
+    ncols = min(4, n)
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows))
     fig.suptitle('TPC-H Query Performance Across Scale Factors', fontsize=16, fontweight='bold')
-    
+
     # Flatten axes for easier iteration
-    axes = axes.flatten()
+    if n == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
     
     # Color scheme for the three execution methods
     colors = {
@@ -66,7 +73,7 @@ def plot_tpch_performance(data, output_file="tpch_performance.png"):
         'substrait_time_s': '^'
     }
     
-    for idx, query in enumerate(QUERIES):
+    for idx, query in enumerate(queries):
         ax = axes[idx]
         
         # Filter data for this query
@@ -117,6 +124,10 @@ def plot_tpch_performance(data, output_file="tpch_performance.png"):
         ax.set_xticks(SCALE_FACTORS)
         ax.set_xticklabels([str(sf) for sf in SCALE_FACTORS])
     
+    # Hide unused subplot cells
+    for idx in range(n, len(axes)):
+        axes[idx].set_visible(False)
+
     plt.tight_layout()
     
     # Save the figure
