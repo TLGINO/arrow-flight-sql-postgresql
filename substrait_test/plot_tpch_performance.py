@@ -15,14 +15,14 @@ from pathlib import Path
 # Configuration
 SCRIPT_DIR = Path(__file__).parent
 SUBSTRAIT_TEST_DIR = SCRIPT_DIR
-SCALE_FACTORS = [0.01, 0.1, 1, 5, 10, 15, 20]
+SCALE_FACTORS = [1, 5, 10, 15, 20]
 
 def load_tpch_data():
     """Load all TPC-H timing CSV files and combine them into a single DataFrame."""
     all_data = []
     
     for sf in SCALE_FACTORS:
-        csv_file = SUBSTRAIT_TEST_DIR / f"timing_tpch_sf{sf}.csv"
+        csv_file = SUBSTRAIT_TEST_DIR / "timing" / f"timing_tpch_sf{sf}.csv"
         if csv_file.exists():
             df = pd.read_csv(csv_file)
             all_data.append(df)

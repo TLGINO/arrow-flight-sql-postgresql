@@ -55,6 +55,8 @@ shared_preload_libraries = 'arrow_flight_sql'
 | `arrow_flight_sql.uri` | `grpc://127.0.0.1:15432` | Flight SQL endpoint URI |
 | `arrow_flight_sql.session_timeout` | `300` (seconds) | Max session duration (-1 = no timeout) |
 | `arrow_flight_sql.max_n_rows_per_record_batch` | `1048576` | Max rows per Arrow record batch |
+| `arrow_flight_sql.explain` | `0` | EXPLAIN mode: 0=off, 1=plan only, 2=analyze |
+| `arrow_flight_sql.explain_dir` | `/tmp/afs_explain` | Directory for EXPLAIN JSON output |
 
 ## Testing
 
@@ -63,16 +65,35 @@ TPC-H (22 queries, 22 pass) and TPC-DS (99 queries, 98 pass).
 Ground truth: psql CSV output vs Flight SQL adapter, row-by-row comparison with decimal rounding and null normalization.
 
 ```sh
-python3 substrait_test/test_substrait.py --benchmark tpch --sf 0.01
-python3 substrait_test/test_substrait.py --benchmark tpcds --sf 0.01
+python3 substrait_test/test_substrait.py --benchmark tpch --sf 1
+python3 substrait_test/test_substrait.py --benchmark tpcds --sf 1
 ```
 
-Scale factors: `0.01`, `0.1`, `1`, `5`, `10`. Data lives in `substrait_test/{benchmark}/data/`. Plans are pre-generated Substrait protobuf via [isthmus-cli][isthmus] in `substrait_test/{benchmark}/plans/`.
+Scale factors: `1`, `5`, `10`, `15`, `20`. Data lives in `substrait_test/{benchmark}/data/`. Plans are pre-generated Substrait protobuf via [isthmus-cli][isthmus] in `substrait_test/{benchmark}/plans/`.
+
+### EXPLAIN Plan Comparison
+
+Generate JSON explain plans for all three execution paths (pgsql, arrow, substrait) and visualize side-by-side:
+
+```sh
+python3 substrait_test/test_substrait.py --explain 7 --benchmark tpch --sf 1
+python3 substrait_test/plot_explain.py tpch
+# open substrait_test/explain/tpch.html
+```
+
+`--explain` bitmask: 4=pgsql, 2=arrow, 1=substrait (7=all). Sets `--run` automatically when `--run` not given. Plans are written as individual JSON files per query per method in `substrait_test/explain/{benchmark}_sf{sf}/`. The HTML viewer shows query tabs, SF sub-tabs, and parallel worker badges (G=gather, W=worker).
+
+### Performance
+
+```sh
+scripts/gen_all_perf.sh        # run all SFs, all methods
+scripts/gen_perf.sh            # subset of queries
+python3 substrait_test/plot_tpch_performance.py
+```
 
 ## Debug
 
 - **`AFS_DEBUG`**: Auto-enabled in debug builds. Logs `substrait_to_query`, `standard_planner`, and execution timings via `elog(LOG)`.
-- **`AFS_EXPLAIN=analyze`**: Set before PG starts. Writes `EXPLAIN ANALYZE` output to `/tmp/afs_explain/`.
 
 ## License
 

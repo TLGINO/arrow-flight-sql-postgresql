@@ -2,8 +2,8 @@
 """Generate plan-structure comparison HTML from JSON explain files.
 
 Usage:
-    python3 substrait_test/plot_explain.py                    # all explain dirs
-    python3 substrait_test/plot_explain.py tpch_sf0.01        # specific dir
+    python3 substrait_test/plot_explain.py                    # all benchmarks
+    python3 substrait_test/plot_explain.py tpch               # specific benchmark
 """
 import json
 import os
@@ -84,11 +84,16 @@ CSS = """\
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,'Segoe UI',Roboto,monospace;background:#1a1a2e;color:#e0e0e0;padding:12px}
 h1{font-size:1.3rem;margin-bottom:10px;color:#fff}
-.tabs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:12px}
+.tabs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
 .tabs a{padding:4px 12px;border-radius:4px;background:#2a2a4a;color:#aaa;text-decoration:none;font-size:.85rem;cursor:pointer}
 .tabs a.active{background:#4a4a8a;color:#fff}
+.sf-tabs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
+.sf-tabs a{padding:3px 10px;border-radius:3px;background:#1e1e3a;color:#888;text-decoration:none;font-size:.75rem;cursor:pointer}
+.sf-tabs a.active{background:#3a3a6a;color:#ccc}
 .query-panel{display:none}
 .query-panel.active{display:block}
+.sf-panel{display:none}
+.sf-panel.active{display:block}
 .methods{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px}
 .method-panel{background:#16213e;border-radius:6px;overflow:hidden}
 .method-hdr{padding:6px 10px;background:#0f3460;font-size:.8rem;font-weight:600;color:#e0e0e0}
@@ -104,18 +109,23 @@ h1{font-size:1.3rem;margin-bottom:10px;color:#fff}
 """
 
 JS = """\
-document.querySelectorAll('.tabs a').forEach(tab=>{
-  tab.addEventListener('click',e=>{
-    e.preventDefault();
-    document.querySelectorAll('.tabs a').forEach(t=>t.classList.remove('active'));
-    tab.classList.add('active');
-    const q=tab.dataset.query;
-    document.querySelectorAll('.query-panel').forEach(p=>{
-      p.classList.toggle('active',p.dataset.query===q);
+function initTabs(container,panelSel,cls){
+  container.querySelectorAll('a').forEach(tab=>{
+    tab.addEventListener('click',e=>{
+      e.preventDefault();
+      container.querySelectorAll('a').forEach(t=>t.classList.remove('active'));
+      tab.classList.add('active');
+      const val=tab.dataset.val;
+      const parent=container.parentElement;
+      parent.querySelectorAll(':scope > '+panelSel).forEach(p=>{
+        p.classList.toggle('active',p.dataset.val===val);
+      });
     });
   });
-});
-document.querySelector('.tabs a')?.click();
+  container.querySelector('a')?.click();
+}
+document.querySelectorAll('.tabs').forEach(t=>initTabs(t,'.query-panel','active'));
+document.querySelectorAll('.sf-tabs').forEach(t=>initTabs(t,'.sf-panel','active'));
 document.querySelectorAll('.ic').forEach(ic=>{
   ic.addEventListener('click',function(e){
     e.stopPropagation();
@@ -134,7 +144,16 @@ document.querySelectorAll('.ic').forEach(ic=>{
 """
 
 
-def generate_html(explain_dir):
+def _sf_sort_key(sf_str):
+    """Sort scale factors numerically."""
+    try:
+        return float(sf_str)
+    except ValueError:
+        return float('inf')
+
+
+def _load_sf_dir(explain_dir):
+    """Load all query plans from one SF directory."""
     query_plans = defaultdict(dict)
     for fname in sorted(os.listdir(explain_dir)):
         m = re.match(r"(Q\d+)_(\w+)\.json$", fname)
@@ -143,68 +162,100 @@ def generate_html(explain_dir):
         query, method = m.group(1), m.group(2)
         with open(os.path.join(explain_dir, fname)) as f:
             query_plans[query][method] = f.read()
+    return query_plans
 
-    if not query_plans:
+
+def generate_html(benchmark, sf_dirs):
+    """Generate single HTML for a benchmark with all its scale factors."""
+    # sf_dirs: list of (sf_label, dir_path)
+    # Collect: sf -> query -> method -> json
+    all_data = {}  # sf -> {query -> {method -> json}}
+    all_queries = set()
+    all_methods = set()
+    for sf, dirpath in sf_dirs:
+        plans = _load_sf_dir(dirpath)
+        if plans:
+            all_data[sf] = plans
+            for q, methods in plans.items():
+                all_queries.add(q)
+                all_methods.update(methods.keys())
+
+    if not all_data:
         return None
 
-    queries = sorted(query_plans.keys())
-    present = sorted(
-        {m for plans in query_plans.values() for m in plans},
-        key=lambda x: METHODS.index(x) if x in METHODS else 99,
-    )
+    sfs = sorted(all_data.keys(), key=_sf_sort_key)
+    queries = sorted(all_queries)
+    present = sorted(all_methods,
+                     key=lambda x: METHODS.index(x) if x in METHODS else 99)
 
-    dirname = os.path.basename(explain_dir)
-    title = dirname.replace("_", " ").upper()
+    title = benchmark.upper()
+    query_tabs = "\n".join(
+        f'<a href="#" data-val="{q}">{q}</a>' for q in queries)
 
-    tabs = "\n".join(f'<a href="#" data-query="{q}">{q}</a>' for q in queries)
-
-    panels = []
+    query_panels = []
     for q in queries:
-        methods_html = []
-        for method in present:
-            pjson = query_plans[q].get(method)
-            if pjson:
-                rows = transform_plan(pjson)
-                methods_html.append(_tree_html(rows, method))
-            else:
-                methods_html.append(f'<div class="method-empty">{method}: no plan</div>')
-        panels.append(
-            f'<div class="query-panel" data-query="{q}">'
-            f'<div class="methods">{"".join(methods_html)}</div></div>'
-        )
+        sf_tabs = "\n".join(
+            f'<a href="#" data-val="{sf}">SF {sf}</a>' for sf in sfs)
+
+        sf_panels = []
+        for sf in sfs:
+            methods_html = []
+            plans = all_data.get(sf, {}).get(q, {})
+            for method in present:
+                pjson = plans.get(method)
+                if pjson:
+                    rows = transform_plan(pjson)
+                    methods_html.append(_tree_html(rows, method))
+                else:
+                    methods_html.append(
+                        f'<div class="method-empty">{method}: no plan</div>')
+            sf_panels.append(
+                f'<div class="sf-panel" data-val="{sf}">'
+                f'<div class="methods">{"".join(methods_html)}</div></div>')
+
+        query_panels.append(
+            f'<div class="query-panel" data-val="{q}">'
+            f'<div class="sf-tabs">{sf_tabs}</div>'
+            f'{"".join(sf_panels)}</div>')
 
     html = (
         f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         f'<title>{title}</title><style>{CSS}</style></head><body>'
-        f'<h1>{title}</h1><div class="tabs">{tabs}</div>'
-        f'{"".join(panels)}<script>{JS}</script></body></html>'
+        f'<h1>{title}</h1><div class="tabs">{query_tabs}</div>'
+        f'{"".join(query_panels)}<script>{JS}</script></body></html>'
     )
 
-    out_path = os.path.join(EXPLAIN_ROOT, f"{dirname}.html")
+    out_path = os.path.join(EXPLAIN_ROOT, f"{benchmark}.html")
     with open(out_path, "w") as f:
         f.write(html)
     return out_path
 
 
 def main():
+    # Group SF dirs by benchmark: tpch_sf1 -> benchmark=tpch, sf=1
+    all_dirs = sorted(
+        d for d in os.listdir(EXPLAIN_ROOT)
+        if os.path.isdir(os.path.join(EXPLAIN_ROOT, d))
+    )
+
+    # Parse benchmark_sfN.NN pattern
+    benchmarks = defaultdict(list)  # benchmark -> [(sf, path)]
+    for d in all_dirs:
+        m = re.match(r"(.+?)_sf(.+)$", d)
+        if m:
+            bench, sf = m.group(1), m.group(2)
+            benchmarks[bench].append((sf, os.path.join(EXPLAIN_ROOT, d)))
+
     targets = sys.argv[1:]
     if targets:
-        dirs = [os.path.join(EXPLAIN_ROOT, t) for t in targets]
-    else:
-        dirs = sorted(
-            os.path.join(EXPLAIN_ROOT, d)
-            for d in os.listdir(EXPLAIN_ROOT)
-            if os.path.isdir(os.path.join(EXPLAIN_ROOT, d))
-        )
-    for d in dirs:
-        if not os.path.isdir(d):
-            print(f"skip {d} (not a directory)")
-            continue
-        out = generate_html(d)
+        benchmarks = {k: v for k, v in benchmarks.items() if k in targets}
+
+    for bench, sf_dirs in sorted(benchmarks.items()):
+        out = generate_html(bench, sf_dirs)
         if out:
             print(f"generated {out}")
         else:
-            print(f"skip {os.path.basename(d)} (no JSON plans)")
+            print(f"skip {bench} (no JSON plans)")
 
 
 if __name__ == "__main__":

@@ -5,8 +5,6 @@ BG=false
 [ "$1" = "--bg" ] && BG=true
 
 run() {
-    python3 substrait_test/test_substrait.py --run 7 --benchmark tpch --sf 0.01
-    python3 substrait_test/test_substrait.py --run 7 --benchmark tpch --sf 0.1
     python3 substrait_test/test_substrait.py --run 7 --benchmark tpch --sf 1
     python3 substrait_test/test_substrait.py --run 7 --benchmark tpch --sf 5
     python3 substrait_test/test_substrait.py --run 7 --benchmark tpch --sf 10

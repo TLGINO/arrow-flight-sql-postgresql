@@ -34,8 +34,8 @@ PSQL_CMD = ["psql", "-h", PGHOST, "-U", PGUSER, "-d", PGDATABASE,
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-SF_DIR_MAP = {"0.01": "sf001", "0.1": "sf010", "1": "sf100",
-              "5": "sf500", "10": "sf1000", "15": "sf1500", "20": "sf2000"}
+SF_DIR_MAP = {"1": "sf100", "5": "sf500", "10": "sf1000",
+              "15": "sf1500", "20": "sf2000"}
 
 # Features the converter currently handles.
 IMPLEMENTED = {"read", "aggregate", "project", "filter", "sort",
@@ -93,8 +93,8 @@ TPCH_REQUIRES = {
     "22": {"aggregate", "filter", "project", "read", "sort", "subquery"},
 }
 
-LINEITEM_ROWS = {"0.01": 60175, "0.1": 600572, "1": 6001215,
-                 "5": 29999795, "10": 59986052, "15": 89989977, "20": 119994608}
+LINEITEM_ROWS = {"1": 6001215, "5": 29999795, "10": 59986052,
+                 "15": 89989977, "20": 119994608}
 
 TPCDS_TABLES = [
     "dbgen_version", "customer_address", "customer_demographics",
@@ -113,8 +113,8 @@ TPCDS_ISTHMUS_SKIP = {
     "35": "isthmus: stddev_samp NULL",
 }
 
-STORE_SALES_ROWS = {"0.01": 28810, "0.1": 288464, "1": 2880404,
-                    "5": 14401460, "10": 28800991, "15": 43201221, "20": 57603868}
+STORE_SALES_ROWS = {"1": 2880404, "5": 14401460, "10": 28800991,
+                    "15": 43201221, "20": 57603868}
 
 BENCHMARKS = {
     "tpch": {
@@ -649,9 +649,9 @@ def main():
     parser.add_argument("--benchmark", default="tpch",
                         choices=BENCHMARKS.keys(),
                         help="Benchmark to run (default: tpch)")
-    parser.add_argument("--sf", default="0.01",
-                        choices=["0.01", "0.1", "1", "5", "10", "15", "20"],
-                        help="Scale factor (default: 0.01)")
+    parser.add_argument("--sf", default="1",
+                        choices=["1", "5", "10", "15", "20"],
+                        help="Scale factor (default: 1)")
     parser.add_argument("--run", type=int, default=None,
                         help="Bitmask: 4=pgsql 2=arrow 1=substrait (default: 5=pgsql+substrait)")
     parser.add_argument("--explain", type=int, nargs="?", const=7, default=0,
