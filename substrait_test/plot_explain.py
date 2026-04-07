@@ -13,10 +13,26 @@ from collections import defaultdict
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPLAIN_ROOT = os.path.join(SCRIPT_DIR, "explain")
-METHODS = ["pgsql", "arrow", "substrait"]
+METHODS = ["arrow", "substrait"]
 
 
-def _walk(node, rows, depth, in_parallel=False):
+def _fmt_time(ms):
+    if ms >= 1000:
+        return f"{ms / 1000:.1f}s"
+    if ms >= 1:
+        return f"{ms:.0f}ms"
+    return f"{ms * 1000:.0f}us"
+
+
+def _fmt_rows(n):
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.1f}K"
+    return str(int(n))
+
+
+def _walk(node, rows, depth):
     label = node.get("Node Type", "?")
     rel = node.get("Relation Name")
     idx = node.get("Index Name")
@@ -27,17 +43,29 @@ def _walk(node, rows, depth, in_parallel=False):
             label += f" {alias}"
     if idx:
         label += f" using {idx}"
-    workers = node.get("Workers Launched", node.get("Workers Planned"))
-    if workers is not None:
-        label += f" (workers: {workers})"
 
-    is_gather = label.startswith("Gather")
+    loops = node.get("Actual Loops", 1) or 1
+    total_time = node.get("Actual Total Time", 0) * loops
+    actual_rows = node.get("Actual Rows", 0) * loops
+
     children = node.get("Plans", [])
-    rows.append({"depth": depth, "label": label, "is_leaf": len(children) == 0,
-                 "parallel": in_parallel, "is_gather": is_gather})
+    child_time = sum(
+        c.get("Actual Total Time", 0) * (c.get("Actual Loops", 1) or 1)
+        for c in children
+    )
+    self_time = max(0, total_time - child_time)
+
+    rows.append({
+        "depth": depth,
+        "label": label,
+        "is_leaf": len(children) == 0,
+        "total_time": total_time,
+        "self_time": self_time,
+        "actual_rows": actual_rows,
+        "loops": loops,
+    })
     for c in children:
-        _walk(c, rows, depth + 1,
-              in_parallel=(True if is_gather else in_parallel))
+        _walk(c, rows, depth + 1)
 
 
 def transform_plan(plan_json):
@@ -46,37 +74,65 @@ def transform_plan(plan_json):
         data = data[0]
     plan = data.get("Plan")
     if not plan:
-        return []
+        return [], 0
     rows = []
-    _walk(plan, rows, depth=1, in_parallel=False)
-    return rows
+    _walk(plan, rows, depth=1)
+    exec_time = data.get("Execution Time", 0)
+    return rows, exec_time
 
 
 def _esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _tree_html(rows, method):
+def _self_pct_color(pct):
+    if pct > 40:
+        return "#c44e52"
+    if pct > 10:
+        return "#dd8452"
+    return "#55a868"
+
+
+def _table_html(rows, method, exec_time):
     if not rows:
         return f'<div class="method-empty">{method}: no plan</div>'
-    lines = []
+
+    root_total = rows[0]["total_time"] if rows else 1
+    if root_total <= 0:
+        root_total = 1
+
+    hdr_time = _fmt_time(exec_time) if exec_time else ""
+    hdr = f"{method.upper()}"
+    if hdr_time:
+        hdr += f" &mdash; {hdr_time}"
+
+    trs = []
     for r in rows:
-        indent = "\u00a0" * ((r["depth"] - 1) * 3)
-        icon = "\u25cb" if r["is_leaf"] else "\u25bc"
-        badge = ""
-        if r.get("is_gather"):
-            badge = ' <span class="badge-g">G</span>'
-        elif r.get("parallel"):
-            badge = ' <span class="badge-w">W</span>'
-        lines.append(
-            f'<div class="node" data-depth="{r["depth"]}">'
-            f'{indent}<span class="ic">{icon}</span> {_esc(r["label"])}{badge}</div>'
+        indent_px = (r["depth"] - 1) * 18
+        icon = "&#9675;" if r["is_leaf"] else "&#9660;"
+        pct = r["self_time"] / root_total * 100 if root_total else 0
+        bar_color = _self_pct_color(pct)
+        bar_w = min(pct, 100)
+
+        trs.append(
+            f'<tr class="node" data-depth="{r["depth"]}">'
+            f'<td class="c-node" style="padding-left:{indent_px}px">'
+            f'<span class="ic">{icon}</span> {_esc(r["label"])}</td>'
+            f'<td class="c-num">{_fmt_time(r["self_time"])}</td>'
+            f'<td class="c-bar"><div class="bar-bg">'
+            f'<div class="bar-fg" style="width:{bar_w:.1f}%;background:{bar_color}"></div>'
+            f'</div><span class="pct-label">{pct:.0f}%</span></td>'
+            f'<td class="c-num">{_fmt_rows(r["actual_rows"])}</td>'
+            f'</tr>'
         )
+
     return (
         f'<div class="method-panel">'
-        f'<div class="method-hdr">{method.upper()}</div>'
-        f'<div class="tree">{"".join(lines)}</div>'
-        f'</div>'
+        f'<div class="method-hdr">{hdr}</div>'
+        f'<table class="plan-table">'
+        f'<thead><tr><th class="h-node">Node</th><th class="h-num">Time</th>'
+        f'<th class="h-bar">Self%</th><th class="h-num">Rows</th></tr></thead>'
+        f'<tbody>{"".join(trs)}</tbody></table></div>'
     )
 
 
@@ -94,18 +150,26 @@ h1{font-size:1.3rem;margin-bottom:10px;color:#fff}
 .query-panel.active{display:block}
 .sf-panel{display:none}
 .sf-panel.active{display:block}
-.methods{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px}
+.methods{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
 .method-panel{background:#16213e;border-radius:6px;overflow:hidden}
 .method-hdr{padding:6px 10px;background:#0f3460;font-size:.8rem;font-weight:600;color:#e0e0e0}
 .method-empty{padding:20px;color:#666;font-style:italic}
-.tree{padding:6px 10px;font-size:.78rem;line-height:1.6}
-.node{white-space:nowrap}
-.node:hover{background:#2a2a4a;border-radius:3px}
-.ic{opacity:.5;font-size:.65rem;cursor:pointer;user-select:none}
+.plan-table{width:100%;border-collapse:collapse;font-size:.75rem;line-height:1.5}
+.plan-table th{text-align:left;padding:3px 6px;border-bottom:1px solid #2a2a4a;color:#888;font-weight:500;font-size:.7rem;position:sticky;top:0;background:#16213e}
+.plan-table td{padding:2px 6px;border-bottom:1px solid #1a1a2e}
+.plan-table tr.node:hover{background:#2a2a4a}
+.c-node{white-space:nowrap;max-width:400px;overflow:hidden;text-overflow:ellipsis}
+.c-num{text-align:right;font-family:'SF Mono',Menlo,monospace;white-space:nowrap;color:#bbb;width:60px}
+.c-bar{width:100px;position:relative}
+.bar-bg{background:#1a1a2e;border-radius:2px;height:12px;overflow:hidden}
+.bar-fg{height:100%;border-radius:2px;min-width:1px}
+.pct-label{font-size:.65rem;color:#888;margin-left:4px}
+.h-node{min-width:200px}
+.h-num{width:60px;text-align:right}
+.h-bar{width:120px}
+.ic{opacity:.5;font-size:.6rem;cursor:pointer;user-select:none}
 .ic:hover{opacity:1}
 .node.collapsed-child{display:none}
-.badge-w{color:#5bc0de;font-size:.65rem;margin-left:4px}
-.badge-g{color:#f0ad4e;font-size:.65rem;margin-left:4px}
 """
 
 JS = """\
@@ -129,11 +193,11 @@ document.querySelectorAll('.sf-tabs').forEach(t=>initTabs(t,'.sf-panel','active'
 document.querySelectorAll('.ic').forEach(ic=>{
   ic.addEventListener('click',function(e){
     e.stopPropagation();
-    const div=this.closest('.node');
-    const d=parseInt(div.dataset.depth);
-    const collapsed=this.textContent==='\\u25b6';
-    this.textContent=collapsed?'\\u25bc':'\\u25b6';
-    let sib=div.nextElementSibling;
+    const tr=this.closest('tr');
+    const d=parseInt(tr.dataset.depth);
+    const collapsed=this.innerHTML==='\\u25b6';
+    this.innerHTML=collapsed?'\\u25bc':'\\u25b6';
+    let sib=tr.nextElementSibling;
     while(sib&&parseInt(sib.dataset.depth)>d){
       if(collapsed)sib.classList.remove('collapsed-child');
       else sib.classList.add('collapsed-child');
@@ -145,7 +209,6 @@ document.querySelectorAll('.ic').forEach(ic=>{
 
 
 def _sf_sort_key(sf_str):
-    """Sort scale factors numerically."""
     try:
         return float(sf_str)
     except ValueError:
@@ -153,7 +216,6 @@ def _sf_sort_key(sf_str):
 
 
 def _load_sf_dir(explain_dir):
-    """Load all query plans from one SF directory."""
     query_plans = defaultdict(dict)
     for fname in sorted(os.listdir(explain_dir)):
         m = re.match(r"(Q\d+)_(\w+)\.json$", fname)
@@ -166,10 +228,7 @@ def _load_sf_dir(explain_dir):
 
 
 def generate_html(benchmark, sf_dirs):
-    """Generate single HTML for a benchmark with all its scale factors."""
-    # sf_dirs: list of (sf_label, dir_path)
-    # Collect: sf -> query -> method -> json
-    all_data = {}  # sf -> {query -> {method -> json}}
+    all_data = {}
     all_queries = set()
     all_methods = set()
     for sf, dirpath in sf_dirs:
@@ -185,8 +244,9 @@ def generate_html(benchmark, sf_dirs):
 
     sfs = sorted(all_data.keys(), key=_sf_sort_key)
     queries = sorted(all_queries)
-    present = sorted(all_methods,
-                     key=lambda x: METHODS.index(x) if x in METHODS else 99)
+    present = sorted(
+        [m for m in all_methods if m in METHODS],
+        key=lambda x: METHODS.index(x))
 
     title = benchmark.upper()
     query_tabs = "\n".join(
@@ -204,8 +264,8 @@ def generate_html(benchmark, sf_dirs):
             for method in present:
                 pjson = plans.get(method)
                 if pjson:
-                    rows = transform_plan(pjson)
-                    methods_html.append(_tree_html(rows, method))
+                    rows, exec_time = transform_plan(pjson)
+                    methods_html.append(_table_html(rows, method, exec_time))
                 else:
                     methods_html.append(
                         f'<div class="method-empty">{method}: no plan</div>')
@@ -232,14 +292,12 @@ def generate_html(benchmark, sf_dirs):
 
 
 def main():
-    # Group SF dirs by benchmark: tpch_sf1 -> benchmark=tpch, sf=1
     all_dirs = sorted(
         d for d in os.listdir(EXPLAIN_ROOT)
         if os.path.isdir(os.path.join(EXPLAIN_ROOT, d))
     )
 
-    # Parse benchmark_sfN.NN pattern
-    benchmarks = defaultdict(list)  # benchmark -> [(sf, path)]
+    benchmarks = defaultdict(list)
     for d in all_dirs:
         m = re.match(r"(.+?)_sf(.+)$", d)
         if m:

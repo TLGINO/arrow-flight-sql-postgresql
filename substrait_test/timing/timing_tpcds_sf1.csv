@@ -1,0 +1,2 @@
+sf,query,status,rows,pg_time_s,arrow_time_s,substrait_time_s,sub_pg_ratio
+1,Q01,PASS,100,87.591,88.793,0.063,0.00

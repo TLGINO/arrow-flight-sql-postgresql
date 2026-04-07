@@ -30,8 +30,8 @@ PERF_PID=$!
 echo "perf record started (pid=$PERF_PID)"
 
 # Run substrait-only TPC-H SF1
-echo "Running TPC-H SF1 substrait..."
-python3 substrait_test/test_substrait.py --benchmark tpch --sf 10 --run 1
+echo "Running TPC-H SF${SF:-1} substrait..."
+python3 substrait_test/test_substrait.py --benchmark tpch --sf "${SF:-1}" --run 1
 echo "Test complete"
 
 # Stop perf

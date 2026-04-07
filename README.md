@@ -42,6 +42,71 @@ sudo ninja -C builddir install
 
 Installs `arrow_flight_sql.so` into the PostgreSQL `pkglibdir`.
 
+## Quick Start
+
+### 1. Load the Extension
+
+Add to `postgresql.conf` and restart PostgreSQL:
+
+```
+shared_preload_libraries = 'arrow_flight_sql'
+```
+
+The adapter starts a gRPC server on `grpc://127.0.0.1:15432`. Authentication uses `pg_hba.conf` — set the Flight SQL client IP to `password` or `trust` (SCRAM/MD5 not yet supported).
+
+### 2. Run a SQL Query
+
+```python
+import pyarrow.flight as flight
+
+client = flight.FlightClient("grpc://127.0.0.1:15432")
+token = client.authenticate_basic_token("postgres", "")
+opts = flight.FlightCallOptions(headers=[token])
+
+# protobuf wire helpers (tag + length-delimited field)
+def varint(v):
+    r = []
+    while v > 0x7F:
+        r.append((v & 0x7F) | 0x80); v >>= 7
+    r.append(v & 0x7F)
+    return bytes(r)
+
+def pb(n, data):
+    return varint((n << 3) | 2) + varint(len(data)) + data
+
+sql = "SELECT 1 AS n, 'hello' AS greeting"
+cmd = pb(1, b"type.googleapis.com/arrow.flight.protocol.sql"
+            b".CommandStatementQuery") \
+    + pb(2, pb(1, sql.encode()))
+
+info = client.get_flight_info(flight.FlightDescriptor.for_command(cmd), opts)
+reader = client.do_get(info.endpoints[0].ticket, opts)
+print(reader.read_all().to_pandas())
+#    n greeting
+# 0  1    hello
+```
+
+### 3. Execute a Substrait Plan
+
+```python
+# read a pre-generated Substrait plan (binary protobuf)
+with open("substrait_test/tpch/plans/01.proto", "rb") as f:
+    plan_bytes = f.read()
+
+# wrap in Flight SQL CommandStatementSubstraitPlan
+cmd = pb(1, b"type.googleapis.com/arrow.flight.protocol.sql"
+            b".CommandStatementSubstraitPlan") \
+    + pb(2, pb(1, pb(1, plan_bytes)))
+
+info = client.get_flight_info(flight.FlightDescriptor.for_command(cmd), opts)
+reader = client.do_get(info.endpoints[0].ticket, opts)
+table = reader.read_all()
+print(f"{table.num_rows} rows, {table.num_columns} cols")
+print(table.to_pandas().head())
+```
+
+Plans are pre-generated Substrait protobuf via [isthmus-cli][isthmus]. See `substrait_test/{tpch,tpcds}/plans/` for all TPC-H and TPC-DS plans.
+
 ## Configuration
 
 Add to `postgresql.conf`:
@@ -54,7 +119,10 @@ shared_preload_libraries = 'arrow_flight_sql'
 |---|---|---|
 | `arrow_flight_sql.uri` | `grpc://127.0.0.1:15432` | Flight SQL endpoint URI |
 | `arrow_flight_sql.session_timeout` | `300` (seconds) | Max session duration (-1 = no timeout) |
+| `arrow_flight_sql.max_sessions` | `256` | Max concurrent sessions (-1 = unlimited) |
+| `arrow_flight_sql.ring_buffer_size` | `8MB` | Shared ring buffer per session (1MB-1GB) |
 | `arrow_flight_sql.max_n_rows_per_record_batch` | `1048576` | Max rows per Arrow record batch |
+| `arrow_flight_sql.ipc_compression` | `false` | ZSTD compression for Arrow IPC batches |
 | `arrow_flight_sql.explain` | `0` | EXPLAIN mode: 0=off, 1=plan only, 2=analyze |
 | `arrow_flight_sql.explain_dir` | `/tmp/afs_explain` | Directory for EXPLAIN JSON output |
 

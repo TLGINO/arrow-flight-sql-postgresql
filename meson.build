@@ -41,6 +41,8 @@ pg_config = find_program(pg_config_names, version: '>= 15')
 cpp_args = []
 if get_option('buildtype').startswith('debug')
   cpp_args += ['-DAFS_DEBUG']
+else
+  cpp_args += ['-DNDEBUG']
 endif
 arrow_flight_sql = dependency(
   'ArrowFlightSql',

@@ -75,6 +75,7 @@ extern "C"
 #include <arrow/table_builder.h>
 #include <arrow/util/base64.h>
 #include <arrow/util/decimal.h>
+#include <arrow/util/compression.h>
 #include <arrow/util/string.h>
 
 #include <cinttypes>
@@ -101,12 +102,7 @@ extern "C"
 #	define PRIsize "zu"
 #endif
 
-// #define AFS_VERBOSE
-#ifdef AFS_VERBOSE
-#	define P(...) ereport(DEBUG5, errmsg_internal(__VA_ARGS__))
-#else
-#	define P(...)
-#endif
+#define P(...)
 
 extern "C"
 {
@@ -133,6 +129,14 @@ static int SessionTimeout;
 
 static const int MaxNRowsPerRecordBatchDefault = 1 * 1024 * 1024;
 static int MaxNRowsPerRecordBatch;
+
+static bool AfsIpcCompression = false;
+
+static const int MaxSessionsDefault = 256;
+static int MaxSessions;
+
+static const int RingBufferSizeDefault = 8 * 1024 * 1024;  // 8 MB
+static int RingBufferSize;
 
 // Explain mode: 0=off, 1=plan-only, 2=analyze (full execution)
 // Controlled via arrow_flight_sql.explain GUC or AFS_EXPLAIN env var fallback
@@ -228,6 +232,28 @@ struct ScopedPlan {
 	SPIPlanPtr plan_;
 };
 
+struct ScopedTupleTableSlot {
+	ScopedTupleTableSlot(TupleDesc tupdesc, const TupleTableSlotOps* ops)
+		: slot_(MakeSingleTupleTableSlot(tupdesc, ops)) {}
+	~ScopedTupleTableSlot() { ExecDropSingleTupleTableSlot(slot_); }
+	TupleTableSlot* get() { return slot_; }
+   private:
+	TupleTableSlot* slot_;
+};
+
+struct ScopedExplainState {
+	ScopedExplainState() : es_(NewExplainState()) {}
+	~ScopedExplainState()
+	{
+		if (es_->str && es_->str->data)
+			pfree(es_->str->data);
+		pfree(es_);
+	}
+	ExplainState* get() { return es_; }
+   private:
+	ExplainState* es_;
+};
+
 struct SharedRingBufferData {
 	dsa_pointer pointer;
 	size_t total;
@@ -285,9 +311,6 @@ class SharedRingBuffer {
 	// Need LWLockAcquire() by caller.
 	size_t write(const void* data, size_t n)
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "write";
-#endif
 		P("%s: %s: %s: before: (%" PRIsize ":%" PRIsize ") %" PRIsize,
 		  Tag,
 		  tag_,
@@ -366,9 +389,6 @@ class SharedRingBuffer {
 	// Need LWLockAcquire() by caller.
 	size_t read(size_t n, void* output)
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "read";
-#endif
 		P("%s: %s: %s: before: (%" PRIsize ":%" PRIsize ") %" PRIsize,
 		  Tag,
 		  tag_,
@@ -487,6 +507,8 @@ dsa_pointer_set_string(dsa_pointer& pointer, dsa_area* area, const std::string& 
 		return;
 	}
 	pointer = dsa_allocate(area, input.size() + 1);
+	if (!DsaPointerIsValid(pointer))
+		ereport(ERROR, errmsg("dsa_allocate failed for %" PRIsize " bytes", input.size() + 1));
 	memcpy(dsa_get_address(area, pointer), input.c_str(), input.size() + 1);
 }
 
@@ -1032,7 +1054,11 @@ class ArrowPGValueConverter : public arrow::ArrayVisitor {
 	arrow::Status Visit(const arrow::BinaryArray& array)
 	{
 		auto value = array.GetView(i_row_);
-		datum_ = PointerGetDatum(cstring_to_text_with_len(value.data(), value.length()));
+		auto len = value.length();
+		bytea* result = static_cast<bytea*>(palloc(VARHDRSZ + len));
+		SET_VARSIZE(result, VARHDRSZ + len);
+		memcpy(VARDATA(result), value.data(), len);
+		datum_ = PointerGetDatum(result);
 		return arrow::Status::OK();
 	}
 
@@ -1061,6 +1087,27 @@ class ArrowPGValueConverter : public arrow::ArrayVisitor {
 		// Arrow uses UNIX epoch (1970-01-01) but PostgreSQL uses 2000-01-01.
 		value -= (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
 		datum_ = TimestampGetDatum(value);
+		return arrow::Status::OK();
+	}
+
+	arrow::Status Visit(const arrow::Decimal128Array& array)
+	{
+		auto decimal_type =
+			std::static_pointer_cast<arrow::Decimal128Type>(array.type());
+		arrow::Decimal128 value(array.GetValue(i_row_));
+		std::string str = value.ToString(decimal_type->scale());
+		datum_ = DirectFunctionCall3(numeric_in,
+		                             CStringGetDatum(str.c_str()),
+		                             ObjectIdGetDatum(InvalidOid),
+		                             Int32GetDatum(-1));
+		return arrow::Status::OK();
+	}
+
+	arrow::Status Visit(const arrow::Date32Array& array)
+	{
+		// Arrow: days since 1970-01-01, PG: days since 2000-01-01
+		datum_ = DateADTGetDatum(
+			array.Value(i_row_) - (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE));
 		return arrow::Status::OK();
 	}
 
@@ -1390,15 +1437,17 @@ class PreparedStatement {
 			return write(writeData);
 		}
 
-		for (const auto& recordBatch : parameters_)
 		{
 			SPIExecuteOptions options = {};
 			std::vector<Oid> pgTypes;
-			ARROW_RETURN_NOT_OK(prepare(options, pgTypes, recordBatch->schema()));
+			ARROW_RETURN_NOT_OK(prepare(options, pgTypes, parameters_[0]->schema()));
 			auto plan = SPI_prepare(query_.c_str(), pgTypes.size(), pgTypes.data());
 			ScopedPlan scopedPlan(plan);
-			ARROW_RETURN_NOT_OK(
-				execute(plan, recordBatch, options, [&]() { return write(writeData); }));
+			for (const auto& recordBatch : parameters_)
+			{
+				ARROW_RETURN_NOT_OK(
+					execute(plan, recordBatch, options, [&]() { return write(writeData); }));
+			}
 		}
 		return arrow::Status::OK();
 	}
@@ -1528,6 +1577,19 @@ class PreparedStatement {
 	std::vector<std::shared_ptr<arrow::RecordBatch>> parameters_;
 };
 
+static arrow::ipc::IpcWriteOptions make_ipc_options()
+{
+	auto options = arrow::ipc::IpcWriteOptions::Defaults();
+	options.emit_dictionary_deltas = true;
+	if (AfsIpcCompression)
+	{
+		auto codec = arrow::util::Codec::Create(arrow::Compression::ZSTD);
+		if (codec.ok())
+			options.codec = *std::move(codec);
+	}
+	return options;
+}
+
 class Executor : public WorkerProcessor {
    public:
 	explicit Executor(uint64_t sessionID)
@@ -1554,8 +1616,6 @@ class Executor : public WorkerProcessor {
 	void open()
 	{
 		const char* tag = "open";
-		// Use this when you want to attach a executor process.
-		// sleep(5);
 		pgstat_report_activity(STATE_RUNNING, (std::string(Tag) + ": opening").c_str());
 		auto session = find_session();
 		PG_TRY();
@@ -1573,9 +1633,8 @@ class Executor : public WorkerProcessor {
 				ResourceOwnerCreate(nullptr, "arrow-flight-sql: Executor");
 			if (check_password(session, databaseName, userName, password, clientAddress))
 			{
-				// TODO: Customizable.
 				SharedRingBuffer::allocate_data(
-					&(session->bufferData), area_, 8L * 1024L * 1024L);
+					&(session->bufferData), area_, (size_t)RingBufferSize);
 			}
 			session->initialized = true;
 			localSession_->valid = true;
@@ -1588,6 +1647,18 @@ class Executor : public WorkerProcessor {
 		}
 		PG_CATCH();
 		{
+			if (CurrentResourceOwner)
+			{
+				auto ro = CurrentResourceOwner;
+				CurrentResourceOwner = nullptr;
+				ResourceOwnerRelease(ro,
+					RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
+				ResourceOwnerRelease(ro,
+					RESOURCE_RELEASE_LOCKS, false, true);
+				ResourceOwnerRelease(ro,
+					RESOURCE_RELEASE_AFTER_LOCKS, false, true);
+				ResourceOwnerDelete(ro);
+			}
 			set_error_message(session, "failed to connect", tag);
 			session->initialized = true;
 			dshash_release_lock(sessions_, session);
@@ -1662,6 +1733,8 @@ class Executor : public WorkerProcessor {
 				// once we have executed the select substait plan,
 				// we pass it back to the original code here and have it serialised into
 				// arrow format
+				case Action::None:
+					break;
 				case Action::Select:
 					select();
 					break;
@@ -1687,8 +1760,18 @@ class Executor : public WorkerProcessor {
 					select_substrait();
 					break;
 				default:
-					// TODO: Report an error
+				{
+					auto session = find_session();
+					set_error_message(
+						session,
+						std::string(Tag) + ": " + tag_ +
+							": unknown action: " +
+							std::to_string(static_cast<int>(action)),
+						"signaled");
+					dshash_release_lock(sessions_, session);
+					signal_server("signaled");
 					break;
+				}
 			}
 		}
 		PG_CATCH();
@@ -1717,7 +1800,7 @@ class Executor : public WorkerProcessor {
 
 	const char* peer_name() override { return "server"; }
 
-	arrow::Status wait_internal(LocalSessionData* sessio51n,
+	arrow::Status wait_internal(LocalSessionData* session,
 	                            SharedRingBuffer* buffer,
 	                            WaitMode mode,
 	                            const char* tag) override
@@ -1747,8 +1830,15 @@ class Executor : public WorkerProcessor {
 				}
 			}
 
-			// TODO: Convert PG error to arrow::Status.
-			CHECK_FOR_INTERRUPTS();
+			PG_TRY();
+			{
+				CHECK_FOR_INTERRUPTS();
+			}
+			PG_CATCH();
+			{
+				return arrow::Status::Cancelled("interrupted");
+			}
+			PG_END_TRY();
 		}
 		return arrow::Status::OK();
 	}
@@ -1821,12 +1911,16 @@ class Executor : public WorkerProcessor {
 		switch (port.hba->auth_method)
 		{
 			case uaMD5:
-				// TODO
-				set_error_message(session, "MD5 auth method isn't supported yet", tag);
+				set_error_message(session,
+					"MD5 auth method is not supported; "
+					"use 'password' or 'trust' in pg_hba.conf for Flight SQL clients",
+					tag);
 				return false;
 			case uaSCRAM:
-				// TODO
-				set_error_message(session, "SCRAM auth method isn't supported yet", tag);
+				set_error_message(session,
+					"SCRAM-SHA-256 auth method is not supported; "
+					"use 'password' or 'trust' in pg_hba.conf for Flight SQL clients",
+					tag);
 				return false;
 			case uaPassword:
 			{
@@ -1962,6 +2056,7 @@ class Executor : public WorkerProcessor {
 		std::string query;
 		{
 			ProcessorLockGuard lock(this);
+			// SAFETY: std::string copies the C-string before dsa_free invalidates it
 			query =
 				static_cast<const char*>(dsa_get_address(area_, session->selectQuery));
 			dsa_free(area_, session->selectQuery);
@@ -1988,7 +2083,9 @@ class Executor : public WorkerProcessor {
 				0);
 				if (eres > 0 && SPI_tuptable)
 				{
-					mkdir(AfsExplainDirGUC, 0755);
+					if (mkdir(AfsExplainDirGUC, 0755) != 0 && errno != EEXIST)
+						elog(WARNING, "%s: %s: failed to create explain dir %s: %m",
+							Tag, tag_, AfsExplainDirGUC);
 					std::string path =
 						std::string(AfsExplainDirGUC) + "/select_sql.json";
 					std::ofstream out(path);
@@ -2060,12 +2157,22 @@ class Executor : public WorkerProcessor {
 			return;
 		}
 
+		// Copy plan out of DSA under lock — must outlive the dsa_free below
 		std::vector<uint8_t> planCopy;
 		size_t planSize;
 		{
 			ProcessorLockGuard lock(this);
 			const uint8_t* planData = static_cast<const uint8_t*>(
 				dsa_get_address(area_, session->substraitPlan));
+			if (!planData)
+			{
+				set_error_message(session,
+					std::string(Tag) + ": " + tag_ + ": " + tag +
+						": dsa_get_address returned NULL for substrait plan",
+					tag);
+				dshash_release_lock(sessions_, session);
+				return;
+			}
 			planSize = session->substraitPlanSize;
 			planCopy.assign(planData, planData + planSize);
 			dsa_free(area_, session->substraitPlan);
@@ -2089,6 +2196,18 @@ class Executor : public WorkerProcessor {
 #endif
 
 			Query* query = substrait_to_query(planCopy.data(), planSize);
+			if (!query)
+			{
+				auto session = find_session();
+				set_error_message(
+					session,
+					std::string(Tag) + ": " + tag_ + ": " + tag +
+						": substrait_to_query returned NULL",
+					tag);
+				dshash_release_lock(sessions_, session);
+				signal_server(tag);
+				return;
+			}
 
 #ifdef AFS_DEBUG
 			clock_gettime(CLOCK_MONOTONIC, &ts1);
@@ -2116,6 +2235,18 @@ class Executor : public WorkerProcessor {
 
 			PlannedStmt* pstmt = standard_planner(query, "<substrait>",
 				CURSOR_OPT_PARALLEL_OK, NULL);
+			if (!pstmt)
+			{
+				auto session = find_session();
+				set_error_message(
+					session,
+					std::string(Tag) + ": " + tag_ + ": " + tag +
+						": standard_planner returned NULL",
+					tag);
+				dshash_release_lock(sessions_, session);
+				signal_server(tag);
+				return;
+			}
 
 #ifdef AFS_DEBUG
 			clock_gettime(CLOCK_MONOTONIC, &ts2);
@@ -2127,7 +2258,8 @@ class Executor : public WorkerProcessor {
 
 		if (AfsExplainMode >= 1)
 			{
-				ExplainState* es = NewExplainState();
+				ScopedExplainState scopedEs;
+				ExplainState* es = scopedEs.get();
 				es->analyze = (AfsExplainMode >= 2);
 				es->costs = true;
 				es->buffers = (AfsExplainMode >= 2);
@@ -2140,7 +2272,9 @@ class Executor : public WorkerProcessor {
 				               NULL, NULL, NULL, NULL, NULL);
 				ExplainEndOutput(es);
 
-				mkdir(AfsExplainDirGUC, 0755);
+				if (mkdir(AfsExplainDirGUC, 0755) != 0 && errno != EEXIST)
+					elog(WARNING, "%s: %s: failed to create explain dir %s: %m",
+						Tag, tag_, AfsExplainDirGUC);
 				/* Write both per-query and latest file */
 				std::string per_query = std::string(AfsExplainDirGUC) + "/" + tag + ".json";
 				std::string latest = std::string(AfsExplainDirGUC) + "/latest.json";
@@ -2150,9 +2284,6 @@ class Executor : public WorkerProcessor {
 					if (out)
 						out << es->str->data;
 				}
-
-				pfree(es->str->data);
-				pfree(es);
 			}
 			QueryDesc* qdesc = CreateQueryDesc(pstmt,
 			                                   "<substrait>",
@@ -2215,13 +2346,25 @@ class Executor : public WorkerProcessor {
 
 			signal_server(tag);
 		}
-		catch (const std::bad_alloc& e)
+		catch (const std::exception& e)
 		{
 			auto session = find_session();
 			set_error_message(
 				session,
 				std::string(Tag) + ": " + tag_ + ": " + tag +
-					": out of memory: " + e.what(),
+					": exception: " + e.what(),
+				tag);
+			dshash_release_lock(sessions_, session);
+
+			signal_server(tag);
+		}
+		catch (...)
+		{
+			auto session = find_session();
+			set_error_message(
+				session,
+				std::string(Tag) + ": " + tag_ + ": " + tag +
+					": unknown exception",
 				tag);
 			dshash_release_lock(sessions_, session);
 
@@ -2232,6 +2375,8 @@ class Executor : public WorkerProcessor {
 	arrow::Status write_record_batches(const char* tag)
 	{
 		SharedRingBufferOutputStream output(this, localSession_);
+		if (!SPI_tuptable)
+			return arrow::Status::Invalid("SPI_tuptable is NULL after query execution");
 		TupleDesc tupdesc = SPI_tuptable->tupdesc;
 		int natts = tupdesc->natts;
 
@@ -2258,10 +2403,9 @@ class Executor : public WorkerProcessor {
 			builders.push_back(std::move(array_builder));
 		}
 
-		auto options = arrow::ipc::IpcWriteOptions::Defaults();
-		options.emit_dictionary_deltas = true;
+		auto options = make_ipc_options();
 
-		// Write schema only stream format data to return only schema.
+		// Write schema-only stream (empty batch carries schema to reader)
 		ARROW_ASSIGN_OR_RAISE(auto writer,
 		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
 		ARROW_ASSIGN_OR_RAISE(auto recordBatch, builder->Flush());
@@ -2274,7 +2418,8 @@ class Executor : public WorkerProcessor {
 		// to read values directly via slot_getattr instead of SPI_getbinval.
 		ARROW_ASSIGN_OR_RAISE(writer,
 		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
-		TupleTableSlot* slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+		ScopedTupleTableSlot scopedSlot(tupdesc, &TTSOpsHeapTuple);
+		TupleTableSlot* slot = scopedSlot.get();
 		uint64_t nRowsInBatch = 0;
 		uint64_t totalRows = 0;
 
@@ -2307,7 +2452,6 @@ class Executor : public WorkerProcessor {
 			ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
 		}
 
-		ExecDropSingleTupleTableSlot(slot);
 		P("%s: %s: %s, write: data: Close", Tag, tag_, tag);
 		ARROW_RETURN_NOT_OK(writer->Close());
 		return output.Close();
@@ -2332,14 +2476,14 @@ class Executor : public WorkerProcessor {
 				!attribute->attnotnull));
 		}
 		auto schema = arrow::schema(fields);
-		auto options = arrow::ipc::IpcWriteOptions::Defaults();
-
-		// Schema batch (empty)
-		ARROW_ASSIGN_OR_RAISE(auto writer,
-		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
 		ARROW_ASSIGN_OR_RAISE(
 			auto builder,
 			arrow::RecordBatchBuilder::Make(schema, arrow::default_memory_pool()));
+		auto options = make_ipc_options();
+
+		// Schema stream (empty batch carries schema to reader)
+		ARROW_ASSIGN_OR_RAISE(auto writer,
+		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
 		ARROW_ASSIGN_OR_RAISE(auto recordBatch, builder->Flush());
 		ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*recordBatch));
 		ARROW_RETURN_NOT_OK(writer->Close());
@@ -2385,10 +2529,9 @@ class Executor : public WorkerProcessor {
 			builders.push_back(std::move(array_builder));
 		}
 
-		auto options = arrow::ipc::IpcWriteOptions::Defaults();
-		options.emit_dictionary_deltas = true;
+		auto options = make_ipc_options();
 
-		// Write schema-only first batch (ring buffer protocol)
+		// Schema stream (empty batch carries schema to reader)
 		ARROW_ASSIGN_OR_RAISE(auto writer,
 		                      arrow::ipc::MakeStreamWriter(&output, schema, options));
 		ARROW_ASSIGN_OR_RAISE(auto recordBatch, builder->Flush());
@@ -2407,12 +2550,20 @@ class Executor : public WorkerProcessor {
 		// 1. Set es_use_parallel_mode — Gather node checks this flag
 		//    (nodeGather.c:160) before launching workers
 		// 2. Call EnterParallelMode — InitializeParallelDSM asserts this
+		// RAII guard ensures ExitParallelMode on early return (ARROW_RETURN_NOT_OK)
+		struct ParallelModeGuard {
+			bool active;
+			ParallelModeGuard(bool enable) : active(enable) {
+				if (active) EnterParallelMode();
+			}
+			~ParallelModeGuard() {
+				if (active) ExitParallelMode();
+			}
+		};
 		bool useParallel = qdesc->plannedstmt->parallelModeNeeded;
 		if (useParallel)
-		{
 			qdesc->estate->es_use_parallel_mode = true;
-			EnterParallelMode();
-		}
+		ParallelModeGuard parallelGuard(useParallel);
 
 		// Fine-grained timing (always-on, minimal overhead)
 		struct timespec t_fetch_start, t_fetch_end, t_append_end;
@@ -2470,9 +2621,6 @@ class Executor : public WorkerProcessor {
 			totalRows += nRowsInBatch;
 		}
 
-		if (useParallel)
-			ExitParallelMode();
-
 		elog(LOG, "AFS_PERF %s: streaming %" PRIu64 " rows: "
 			"fetch=%.1f ms, arrow_append=%.1f ms, ipc_write=%.1f ms",
 			tag, totalRows, fetch_ns / 1e6, append_ns / 1e6, ipc_ns / 1e6);
@@ -2501,6 +2649,7 @@ class Executor : public WorkerProcessor {
 		std::string query;
 		{
 			ProcessorLockGuard lock(this);
+			// SAFETY: std::string copies the C-string before dsa_free invalidates it
 			query =
 				static_cast<const char*>(dsa_get_address(area_, session->updateQuery));
 			dsa_free(area_, session->updateQuery);
@@ -2553,6 +2702,7 @@ class Executor : public WorkerProcessor {
 		std::string query;
 		{
 			ProcessorLockGuard lock(this);
+			// SAFETY: std::string copies the C-string before dsa_free invalidates it
 			query =
 				static_cast<const char*>(dsa_get_address(area_, session->prepareQuery));
 			dsa_free(area_, session->prepareQuery);
@@ -2582,6 +2732,7 @@ class Executor : public WorkerProcessor {
 
 		{
 			ProcessorLockGuard lock(this);
+			// SAFETY: std::string copies the C-string before dsa_free invalidates it
 			handle = static_cast<const char*>(
 				dsa_get_address(area_, session->preparedStatementHandle));
 			dsa_free(area_, session->preparedStatementHandle);
@@ -2826,8 +2977,7 @@ class Proxy : public WorkerProcessor {
 		: WorkerProcessor("proxy"),
 		  mutex_(),
 		  conditionVariable_(),
-		  randomSeed_(),
-		  randomEngine_(randomSeed_()),
+		  cryptoRng_(),
 		  localSessions_(),
 		  connectRequests_(),
 		  selectRequests_(),
@@ -2845,8 +2995,7 @@ class Proxy : public WorkerProcessor {
    private:
 	std::mutex mutex_;
 	std::condition_variable conditionVariable_;
-	std::random_device randomSeed_;
-	std::mt19937_64 randomEngine_;
+	std::random_device cryptoRng_;
 	std::map<uint64_t, std::shared_ptr<LocalSessionData>> localSessions_;
 
    public:
@@ -3029,6 +3178,10 @@ class Proxy : public WorkerProcessor {
 					                               request->userName,
 					                               request->password,
 					                               request->clientAddress);
+					// Zero password after copy to DSA
+					if (!request->password.empty())
+						explicit_bzero(request->password.data(),
+						               request->password.size());
 					haveRequest = true;
 					++it;
 				}
@@ -3045,9 +3198,16 @@ class Proxy : public WorkerProcessor {
 	uint64_t assign_session_id()
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
+		if (MaxSessions >= 0 &&
+		    static_cast<int>(localSessions_.size()) >= MaxSessions)
+		{
+			return 0;
+		}
 		while (true)
 		{
-			auto id = randomEngine_();
+			// Use crypto RNG for unpredictable session IDs
+			uint64_t id = (static_cast<uint64_t>(cryptoRng_()) << 32) |
+			              static_cast<uint64_t>(cryptoRng_());
 			if (id == 0)
 			{
 				continue;
@@ -3073,6 +3233,12 @@ class Proxy : public WorkerProcessor {
 	                                const std::string& clientAddress)
 	{
 		auto id = assign_session_id();
+		if (id == 0)
+		{
+			return arrow::Status::CapacityError(
+				"too many sessions (limit: " +
+				std::to_string(MaxSessions) + ")");
+		}
 		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(id));
 		auto request = std::make_shared<ConnectRequest>(
 			id, databaseName, userName, password, clientAddress);
@@ -3083,17 +3249,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3133,9 +3305,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_substrait_select_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "substrait_select";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto& request : substraitSelectRequests_)
 		{
@@ -3168,9 +3337,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_select_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "select";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto& request : selectRequests_)
 		{
@@ -3203,18 +3369,15 @@ class Proxy : public WorkerProcessor {
 		auto input =
 			std::make_shared<SharedRingBufferInputStream>(this, std::move(localSession));
 
-		// Read schema only stream format data.
+		// Read and drain the schema-only stream (one empty batch).
 		ARROW_ASSIGN_OR_RAISE(auto reader,
 		                      arrow::ipc::RecordBatchStreamReader::Open(input));
 		while (true)
 		{
 			std::shared_ptr<arrow::RecordBatch> recordBatch;
-			P("%s: %s: %s: read next", Tag, tag_, tag);
 			ARROW_RETURN_NOT_OK(reader->ReadNext(&recordBatch));
 			if (!recordBatch)
-			{
 				break;
-			}
 		}
 		return reader->schema();
 	}
@@ -3233,17 +3396,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3268,17 +3437,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3310,9 +3485,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_update_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "update";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto it = updateRequests_.begin(); it != updateRequests_.end();)
 		{
@@ -3370,9 +3542,6 @@ class Proxy : public WorkerProcessor {
    public:
 	arrow::Result<int64_t> update(uint64_t sessionID, const std::string& query)
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "update";
-#endif
 		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(sessionID));
 		auto request = std::make_shared<UpdateRequest>(localSession, query);
 		{
@@ -3382,17 +3551,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3422,9 +3597,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_prepare_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "prepare";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto it = prepareRequests_.begin(); it != prepareRequests_.end();)
 		{
@@ -3485,9 +3657,6 @@ class Proxy : public WorkerProcessor {
 	arrow::Result<arrow::flight::sql::ActionCreatePreparedStatementResult> prepare(
 		uint64_t sessionID, const std::string& query)
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "prepare";
-#endif
 		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(sessionID));
 		auto request = std::make_shared<PrepareRequest>(localSession, query);
 		{
@@ -3497,17 +3666,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3542,9 +3717,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_close_prepared_statement_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "close prepared statement";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto it = closePreparedStatementRequests_.begin();
 		     it != closePreparedStatementRequests_.end();)
@@ -3601,9 +3773,6 @@ class Proxy : public WorkerProcessor {
    public:
 	arrow::Status close_prepared_statement(uint64_t sessionID, const std::string& handle)
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "close prepared statement";
-#endif
 		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(sessionID));
 		auto request =
 			std::make_shared<ClosePreparedStatementRequest>(localSession, handle);
@@ -3614,17 +3783,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3653,9 +3828,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_set_parameters_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "set parameters";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto it = setParametersRequests_.begin();
 		     it != setParametersRequests_.end();)
@@ -3716,9 +3888,6 @@ class Proxy : public WorkerProcessor {
 	                             arrow::flight::FlightMessageReader* reader,
 	                             arrow::flight::FlightMetadataWriter* writer)
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "set parameters";
-#endif
 		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(sessionID));
 		auto request = std::make_shared<SetParametersRequest>(localSession, handle);
 		{
@@ -3730,8 +3899,7 @@ class Proxy : public WorkerProcessor {
 		{
 			ARROW_ASSIGN_OR_RAISE(const auto& schema, reader->GetSchema());
 			SharedRingBufferOutputStream output(this, localSession);
-			auto options = arrow::ipc::IpcWriteOptions::Defaults();
-			options.emit_dictionary_deltas = true;
+			auto options = make_ipc_options();
 			ARROW_ASSIGN_OR_RAISE(auto writer,
 			                      arrow::ipc::MakeStreamWriter(&output, schema, options));
 			while (true)
@@ -3749,17 +3917,23 @@ class Proxy : public WorkerProcessor {
 		}
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3787,9 +3961,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_select_prepared_statement_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "select prepared statement";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto& request : selectPreparedStatementRequests_)
 		{
@@ -3831,17 +4002,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -3875,9 +4052,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_update_prepared_statement_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "update prepared statement";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto it = updatePreparedStatementRequests_.begin();
 		     it != updatePreparedStatementRequests_.end();)
@@ -3939,9 +4113,6 @@ class Proxy : public WorkerProcessor {
 		const std::string& handle,
 		arrow::flight::FlightMessageReader* reader)
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "update prepared statement";
-#endif
 		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(sessionID));
 		auto request =
 			std::make_shared<UpdatePreparedStatementRequest>(localSession, handle);
@@ -3954,8 +4125,7 @@ class Proxy : public WorkerProcessor {
 		{
 			ARROW_ASSIGN_OR_RAISE(const auto& schema, reader->GetSchema());
 			SharedRingBufferOutputStream output(this, localSession);
-			auto options = arrow::ipc::IpcWriteOptions::Defaults();
-			options.emit_dictionary_deltas = true;
+			auto options = make_ipc_options();
 			ARROW_ASSIGN_OR_RAISE(auto writer,
 			                      arrow::ipc::MakeStreamWriter(&output, schema, options));
 			while (true)
@@ -3973,17 +4143,23 @@ class Proxy : public WorkerProcessor {
 		}
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -4018,9 +4194,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_read_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "read";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto& request : readRequests_)
 		{
@@ -4054,17 +4227,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -4098,9 +4277,6 @@ class Proxy : public WorkerProcessor {
 	// Can use PostgreSQL API.
 	void process_write_requests()
 	{
-#ifdef AFS_VERBOSE
-		const char* tag = "write";
-#endif
 		std::lock_guard<std::mutex> lock(mutex_);
 		for (auto& request : writeRequests_)
 		{
@@ -4149,17 +4325,23 @@ class Proxy : public WorkerProcessor {
 		kill(MyProcPid, SIGUSR1);
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
-			conditionVariable_.wait(lock, [&] {
-				if (localSession->errorMessage.has_value())
-				{
-					return true;
-				}
-				if (INTERRUPTS_PENDING_CONDITION())
-				{
-					return true;
-				}
-				return request->finished;
-			});
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for executor");
+			}
 		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
@@ -4182,15 +4364,16 @@ class Proxy : public WorkerProcessor {
 			}
 			if (DsaPointerIsValid(session->errorMessage))
 			{
-				std::lock_guard<std::mutex> lock(mutex_);
-				auto localSession = localSessions_.find(session->id)->second;
-				if (localSession)
-				{
-					localSession->errorMessage = static_cast<const char*>(
-						dsa_get_address(area_, session->errorMessage));
-				}
+				std::string errorCopy(static_cast<const char*>(
+					dsa_get_address(area_, session->errorMessage)));
 				dsa_free(area_, session->errorMessage);
 				session->errorMessage = InvalidDsaPointer;
+				std::lock_guard<std::mutex> lock(mutex_);
+				auto it = localSessions_.find(session->id);
+				if (it != localSessions_.end() && it->second)
+				{
+					it->second->errorMessage = std::move(errorCopy);
+				}
 			}
 			if (session->finished)
 			{
@@ -4216,26 +4399,32 @@ class Proxy : public WorkerProcessor {
 	                            const char* tag) override
 	{
 		std::unique_lock<std::mutex> lock(mutex_);
-		conditionVariable_.wait(lock, [&] {
-			P("%s: %s: %s: %s: wait: %" PRIsize ": error: %s",
-			  Tag,
-			  tag_,
-			  tag,
-			  peer_name(),
-			  get_waiting_buffer_size(buffer, mode),
-			  localSession->errorMessage.has_value()
-			      ? localSession->errorMessage.value().c_str()
-			      : "");
-			if (localSession->errorMessage.has_value())
-			{
-				return true;
-			}
-			if (INTERRUPTS_PENDING_CONDITION())
-			{
-				return true;
-			}
-			return get_waiting_buffer_size(buffer, mode) > 0;
-		});
+		if (!conditionVariable_.wait_for(
+				lock,
+				std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+				[&] {
+					P("%s: %s: %s: %s: wait: %" PRIsize ": error: %s",
+					  Tag,
+					  tag_,
+					  tag,
+					  peer_name(),
+					  get_waiting_buffer_size(buffer, mode),
+					  localSession->errorMessage.has_value()
+					      ? localSession->errorMessage.value().c_str()
+					      : "");
+					if (localSession->errorMessage.has_value())
+					{
+						return true;
+					}
+					if (INTERRUPTS_PENDING_CONDITION())
+					{
+						return true;
+					}
+					return get_waiting_buffer_size(buffer, mode) > 0;
+				}))
+		{
+			return arrow::Status::IOError("timeout waiting for executor");
+		}
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession, true));
 		CHECK_FOR_INTERRUPTS();
 		return arrow::Status::OK();
@@ -4365,7 +4554,11 @@ class MainProcessor : public Processor {
 						}
 					} catch (const std::exception& exception)
 					{
+						// Intentional: mark finished and continue processing
+						// other sessions — one crashed executor shouldn't block all.
 						session->finished = true;
+						elog(WARNING, "%s: executor session %" PRIu64 ": %s",
+							Tag, session->id, exception.what());
 					}
 				}
 				continue;
@@ -4490,6 +4683,9 @@ class HeaderAuthServerMiddlewareFactory : public arrow::flight::ServerMiddleware
 #endif
 			auto sessionIDResult =
 				proxy_->connect(databaseName, userName, password, clientAddress);
+			// Zero password before any return path
+			if (!password.empty())
+				explicit_bzero(password.data(), password.size());
 			if (!sessionIDResult.status().ok())
 			{
 				return arrow::flight::MakeFlightError(
@@ -4511,8 +4707,9 @@ class HeaderAuthServerMiddlewareFactory : public arrow::flight::ServerMiddleware
 			}
 			auto start = sessionIDString.c_str();
 			char* end = nullptr;
+			errno = 0;
 			uint64_t sessionID = std::strtoull(start, &end, 10);
-			if (end[0] != '\0')
+			if (end[0] != '\0' || errno == ERANGE)
 			{
 				return arrow::flight::MakeFlightError(
 					arrow::flight::FlightStatusCode::Unauthorized,
@@ -4578,10 +4775,11 @@ class FlightSQLServer : public arrow::flight::sql::FlightSqlServerBase {
 		const auto& plan = command.plan.plan;
 		ARROW_ASSIGN_OR_RAISE(auto schema,
 		                      proxy_->substrait_select(sessionID, plan));
-		// Use a fixed ticket identifier for substrait queries
+		// Use session ID to make tickets unique per session
 		ARROW_ASSIGN_OR_RAISE(
 			auto ticket,
-			arrow::flight::sql::CreateStatementQueryTicket("substrait"));
+			arrow::flight::sql::CreateStatementQueryTicket(
+				"substrait:" + std::to_string(sessionID)));
 		std::vector<arrow::flight::FlightEndpoint> endpoints{
 			create_endpoint(std::move(ticket))};
 		ARROW_ASSIGN_OR_RAISE(
@@ -4686,7 +4884,7 @@ class FlightSQLServer : public arrow::flight::sql::FlightSqlServerBase {
 
 	arrow::Result<uint64_t> session_id(const arrow::flight::ServerCallContext& context)
 	{
-		auto middleware = reinterpret_cast<HeaderAuthServerMiddleware*>(
+		auto middleware = static_cast<HeaderAuthServerMiddleware*>(
 			context.GetMiddleware("header-auth"));
 		if (!middleware)
 		{
@@ -4698,6 +4896,8 @@ class FlightSQLServer : public arrow::flight::sql::FlightSqlServerBase {
 
 	Proxy* proxy_;
 };
+
+static void afs_server_before_shmem_exit(int code, Datum arg);
 
 arrow::Status
 afs_server_internal(Proxy* proxy)
@@ -4735,6 +4935,8 @@ afs_server_internal(Proxy* proxy)
 		{"header-auth", std::make_shared<HeaderAuthServerMiddlewareFactory>(proxy)});
 	FlightSQLServer flightSQLServer(proxy);
 	ARROW_RETURN_NOT_OK(flightSQLServer.Init(options));
+	before_shmem_exit(afs_server_before_shmem_exit,
+	                  PointerGetDatum(&flightSQLServer));
 
 	ereport(LOG, (errmsg("listening on %s for Apache Arrow Flight SQL", URI)));
 
@@ -4764,9 +4966,22 @@ afs_server_internal(Proxy* proxy)
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	// TODO: Use before_shmem_exit()
-	auto deadline = std::chrono::system_clock::now() + std::chrono::microseconds(10);
+	cancel_before_shmem_exit(afs_server_before_shmem_exit,
+	                         PointerGetDatum(&flightSQLServer));
+	auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
 	return flightSQLServer.Shutdown(&deadline);
+}
+
+static void
+afs_server_before_shmem_exit(int code, Datum arg)
+{
+	// Registered via before_shmem_exit() to ensure the Flight SQL server
+	// shuts down on abnormal process exit (e.g. postmaster death).
+	auto server = reinterpret_cast<arrow::flight::FlightServerBase*>(DatumGetPointer(arg));
+	auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+	auto status = server->Shutdown(&deadline);
+	if (!status.ok())
+		elog(WARNING, "%s: server shutdown failed: %s", Tag, status.ToString().c_str());
 }
 
 }  // namespace
@@ -4937,6 +5152,19 @@ _PG_init(void)
 	                           NULL,
 	                           NULL);
 
+	DefineCustomIntVariable("arrow_flight_sql.max_sessions",
+	                        "Maximum number of concurrent sessions.",
+	                        "The default is 256. -1 means no limit.",
+	                        &MaxSessions,
+	                        MaxSessionsDefault,
+	                        -1,
+	                        INT_MAX,
+	                        PGC_SIGHUP,
+	                        0,
+	                        NULL,
+	                        NULL,
+	                        NULL);
+
 	DefineCustomIntVariable("arrow_flight_sql.session_timeout",
 	                        "Maximum session duration in seconds.",
 	                        "The default is 300 seconds. "
@@ -4975,6 +5203,17 @@ _PG_init(void)
 	                           NULL,
 	                           NULL);
 
+	DefineCustomBoolVariable("arrow_flight_sql.ipc_compression",
+	                         "Enable ZSTD compression for Arrow IPC batches.",
+	                         "default: false",
+	                         &AfsIpcCompression,
+	                         false,
+	                         PGC_USERSET,
+	                         0,
+	                         NULL,
+	                         NULL,
+	                         NULL);
+
 	DefineCustomIntVariable("arrow_flight_sql.max_n_rows_per_record_batch",
 	                        "The maximum number of rows per record batch.",
 	                        "The default is 1 * 1024 * 1024 rows.",
@@ -4984,6 +5223,19 @@ _PG_init(void)
 	                        INT_MAX,
 	                        PGC_USERSET,
 	                        0,
+	                        NULL,
+	                        NULL,
+	                        NULL);
+
+	DefineCustomIntVariable("arrow_flight_sql.ring_buffer_size",
+	                        "Size of the shared ring buffer per session in bytes.",
+	                        "The default is 8 MB.",
+	                        &RingBufferSize,
+	                        RingBufferSizeDefault,
+	                        1024 * 1024,       /* min: 1 MB */
+	                        1024 * 1024 * 1024, /* max: 1 GB */
+	                        PGC_SIGHUP,
+	                        GUC_UNIT_BYTE,
 	                        NULL,
 	                        NULL,
 	                        NULL);

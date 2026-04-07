@@ -570,7 +570,7 @@ read_rel_to_rte(const substrait::ReadRel &read,
         }
         for (int i = list_length(colnames); i < ncols; i++)
             colnames = lappend(colnames,
-                makeString(pstrdup(sfmt("col%d", i + 1).c_str())));
+                makeString(psprintf("col%d", i + 1)));
 
         RangeTblEntry *rte = makeNode(RangeTblEntry);
         rte->rtekind = RTE_VALUES;
@@ -615,38 +615,35 @@ read_rel_to_rte(const substrait::ReadRel &read,
     if (read.has_base_schema())
     {
         const auto &bs = read.base_schema();
+
+        /* Build lowercase attname → index map for O(1) lookup */
+        std::unordered_map<std::string, int> att_map;
+        for (int j = 0; j < tupdesc->natts; j++)
+        {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, j);
+            if (attr->attisdropped)
+                continue;
+            std::string lower = NameStr(attr->attname);
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            att_map[lower] = j;
+        }
+
         for (int i = 0; i < bs.names_size(); i++)
         {
-            const std::string &col = bs.names(i);
-            bool found = false;
-            for (int j = 0; j < tupdesc->natts; j++)
-            {
-                Form_pg_attribute attr = TupleDescAttr(tupdesc, j);
-                if (attr->attisdropped)
-                    continue;
-                {
-                    std::string attname_lower = NameStr(attr->attname);
-                    std::string col_lower = col;
-                    std::transform(attname_lower.begin(), attname_lower.end(),
-                                   attname_lower.begin(), ::tolower);
-                    std::transform(col_lower.begin(), col_lower.end(),
-                                   col_lower.begin(), ::tolower);
-                    if (attname_lower == col_lower)
-                    {
-                        schema_out.push_back({0, attr->attnum, attr->atttypid, nullptr});
-                        colnames = lappend(colnames,
-                                           makeString(pstrdup(NameStr(attr->attname))));
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if (!found)
+            std::string col_lower = bs.names(i);
+            std::transform(col_lower.begin(), col_lower.end(),
+                           col_lower.begin(), ::tolower);
+            auto it = att_map.find(col_lower);
+            if (it == att_map.end())
             {
                 RelationClose(rel);
                 throw SubstraitError(sfmt("substrait: column \"%s\" not found in \"%s\"",
-                                          col.c_str(), names[0].c_str()));
+                                          bs.names(i).c_str(), names[0].c_str()));
             }
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, it->second);
+            schema_out.push_back({0, attr->attnum, attr->atttypid, nullptr});
+            colnames = lappend(colnames,
+                               makeString(pstrdup(NameStr(attr->attname))));
         }
     }
     else
@@ -809,7 +806,8 @@ build_from_node(const substrait::Rel &rel, Query *query,
             case substrait::JoinRel::JOIN_TYPE_OUTER:
                 pg_jtype = JOIN_FULL; break;
             default:
-                throw SubstraitError(sfmt("substrait: unsupported join type %d",
+                throw SubstraitError(sfmt("substrait: unsupported join type %d"
+                                          " (SEMI/ANTI joins require EXISTS subquery conversion)",
                                           jn.type()));
         }
 
@@ -2020,6 +2018,69 @@ convert_expression(const substrait::Expression &expr,
                                      false, false);
         }
 
+        /* Substrait timestamp: microseconds since Unix epoch (1970-01-01).
+         * PG Timestamp: microseconds since PG epoch (2000-01-01).
+         * Offset: 10957 days * 86400 sec * 1e6 us = 946684800000000 */
+        static constexpr int64 UNIX_TO_PG_EPOCH_US = 946684800000000LL;
+
+        if (lit.has_timestamp())
+        {
+            /* Deprecated field: value is microseconds since Unix epoch */
+            int64 pg_ts = lit.timestamp() - UNIX_TO_PG_EPOCH_US;
+            return (Expr *)makeConst(TIMESTAMPOID, -1, InvalidOid, 8,
+                                     Int64GetDatum(pg_ts), false, true);
+        }
+        if (lit.has_timestamp_tz())
+        {
+            /* Deprecated field: microseconds since Unix epoch, with TZ */
+            int64 pg_ts = lit.timestamp_tz() - UNIX_TO_PG_EPOCH_US;
+            return (Expr *)makeConst(TIMESTAMPTZOID, -1, InvalidOid, 8,
+                                     Int64GetDatum(pg_ts), false, true);
+        }
+        if (lit.has_precision_timestamp())
+        {
+            const auto &pt = lit.precision_timestamp();
+            int64 us;
+            switch (pt.precision())
+            {
+                case 0: us = pt.value() * 1000000; break; /* seconds */
+                case 3: us = pt.value() * 1000;    break; /* milliseconds */
+                case 6: us = pt.value();            break; /* microseconds */
+                case 9: us = pt.value() / 1000;    break; /* nanoseconds */
+                default:
+                    throw SubstraitError(sfmt("substrait: unsupported timestamp precision %d",
+                                              pt.precision()));
+            }
+            int64 pg_ts = us - UNIX_TO_PG_EPOCH_US;
+            return (Expr *)makeConst(TIMESTAMPOID, -1, InvalidOid, 8,
+                                     Int64GetDatum(pg_ts), false, true);
+        }
+        if (lit.has_precision_timestamp_tz())
+        {
+            const auto &pt = lit.precision_timestamp_tz();
+            int64 us;
+            switch (pt.precision())
+            {
+                case 0: us = pt.value() * 1000000; break;
+                case 3: us = pt.value() * 1000;    break;
+                case 6: us = pt.value();            break;
+                case 9: us = pt.value() / 1000;    break;
+                default:
+                    throw SubstraitError(sfmt("substrait: unsupported timestamp_tz precision %d",
+                                              pt.precision()));
+            }
+            int64 pg_ts = us - UNIX_TO_PG_EPOCH_US;
+            return (Expr *)makeConst(TIMESTAMPTZOID, -1, InvalidOid, 8,
+                                     Int64GetDatum(pg_ts), false, true);
+        }
+        if (lit.has_time())
+        {
+            /* Substrait time: microseconds since midnight.
+             * PG TimeADT: also microseconds since midnight. */
+            return (Expr *)makeConst(TIMEOID, -1, InvalidOid, 8,
+                                     Int64GetDatum(lit.time()), false, true);
+        }
+
         /* Typed NULL literal — e.g. null { decimal { ... } } */
         if (lit.has_null())
         {
@@ -2036,6 +2097,11 @@ convert_expression(const substrait::Expression &expr,
             else if (t.has_varchar()) nulltype = VARCHAROID;
             else if (t.has_fixed_char()) nulltype = BPCHAROID;
             else if (t.has_date())    nulltype = DATEOID;
+            else if (t.has_timestamp() || t.has_precision_timestamp())
+                                       nulltype = TIMESTAMPOID;
+            else if (t.has_timestamp_tz() || t.has_precision_timestamp_tz())
+                                       nulltype = TIMESTAMPTZOID;
+            else if (t.has_time())     nulltype = TIMEOID;
             else if (t.has_decimal())
             {
                 nulltype = NUMERICOID;
@@ -2133,6 +2199,16 @@ convert_expression(const substrait::Expression &expr,
                 dst_type = VARCHAROID;
             else if (t.has_fixed_char())
                 dst_type = BPCHAROID;
+            else if (t.has_timestamp() || t.has_precision_timestamp())
+                dst_type = TIMESTAMPOID;
+            else if (t.has_timestamp_tz() || t.has_precision_timestamp_tz())
+                dst_type = TIMESTAMPTZOID;
+            else if (t.has_time())
+                dst_type = TIMEOID;
+            else if (t.has_interval_day())
+                dst_type = INTERVALOID;
+            else if (t.has_interval_year())
+                dst_type = INTERVALOID;
         }
 
         if (!OidIsValid(dst_type))
@@ -3356,6 +3432,11 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                     const SubstraitSchema *outer_schema,
                     RelCache *rel_cache, int depth)
 {
+    static constexpr int kMaxQueryDepth = 100;
+    if (depth > kMaxQueryDepth)
+        throw SubstraitError(
+            sfmt("substrait: query nesting too deep (>%d levels)", kMaxQueryDepth));
+
     /* CTE dedup: check if this subtree was already built (hash-first). */
     std::string fp;
     bool is_dup = false;
@@ -3700,8 +3781,11 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                 for (int i = 0; i < sel.struct_items_size(); i++)
                 {
                     int base_idx = sel.struct_items(i).field();
-                    if (base_idx >= 0 && base_idx < (int)schema.size())
-                        projected_schema.push_back(schema[base_idx]);
+                    if (base_idx < 0 || base_idx >= (int)schema.size())
+                        throw SubstraitError(sfmt(
+                            "substrait: projection index %d out of range (schema size %d)",
+                            base_idx, (int)schema.size()));
+                    projected_schema.push_back(schema[base_idx]);
                 }
             }
         }
@@ -3736,7 +3820,13 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                     }
                     else
                     {
-                        Expr *ve = raw_virtuals[src - n_input];
+                        int vidx = src - n_input;
+                        if (vidx < 0 || vidx >= (int)raw_virtuals.size())
+                            throw SubstraitError(sfmt(
+                                "substrait: emit mapping index %d out of range "
+                                "(input=%d, virtuals=%d)",
+                                src, n_input, (int)raw_virtuals.size()));
+                        Expr *ve = raw_virtuals[vidx];
                         new_schema.push_back({0, 0, exprType((Node *)ve), nullptr});
                         virtual_map[i] = ve;
                     }
@@ -3832,7 +3922,13 @@ build_query_for_rel(const substrait::Rel *cur, const FuncMap &func_map,
                     }
                     else
                     {
-                        Expr *ve = raw_virtuals[src - n_input];
+                        int vidx = src - n_input;
+                        if (vidx < 0 || vidx >= (int)raw_virtuals.size())
+                            throw SubstraitError(sfmt(
+                                "substrait: emit mapping index %d out of range "
+                                "(input=%d, virtuals=%d)",
+                                src, n_input, (int)raw_virtuals.size()));
+                        Expr *ve = raw_virtuals[vidx];
                         new_schema.push_back({0, 0, exprType((Node *)ve), nullptr});
                         virtual_map[i] = ve;
                     }
