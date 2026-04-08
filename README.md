@@ -6,6 +6,10 @@ PostgreSQL extension that receives [Substrait][substrait] plans over [Arrow Flig
 Flight SQL gRPC → Substrait protobuf → PG Query* → standard_planner → executor → Arrow batches
 ```
 
+## Architecture
+
+![Adapter Architecture](doc/images/architecture.svg)
+
 ## Substrait Support
 
 ### Relation Types
@@ -128,16 +132,25 @@ shared_preload_libraries = 'arrow_flight_sql'
 
 ## Testing
 
-TPC-H (22 queries, 22 pass) and TPC-DS (99 queries, 98 pass).
+![Test Architecture](doc/images/test-architecture.svg)
 
-Ground truth: psql CSV output vs Flight SQL adapter, row-by-row comparison with decimal rounding and null normalization.
+Correctness is verified by running each query through three independent execution paths and comparing results row-by-row:
+
+1. **PG ground truth** — native `psql` CSV output (the reference)
+2. **Arrow Flight SQL** — same SQL sent over Flight SQL, returned as Arrow batches
+3. **Substrait** — pre-generated binary Substrait plan sent over Flight SQL
+
+All three paths must produce identical results after normalization (floats rounded to 4 decimals, dates to ISO, nulls unified). The `--run` bitmask selects which paths to execute: `4`=pgsql, `2`=arrow, `1`=substrait (default `5`=pgsql+substrait, `7`=all three).
+
+TPC-H: 22 queries, 22 pass. TPC-DS: 99 queries, 98 pass.
 
 ```sh
-python3 substrait_test/test_substrait.py --benchmark tpch --sf 1
+python3 substrait_test/test_substrait.py --benchmark tpch --sf 1          # pgsql + substrait
+python3 substrait_test/test_substrait.py --benchmark tpch --sf 1 --run 7  # all three paths
 python3 substrait_test/test_substrait.py --benchmark tpcds --sf 1
 ```
 
-Scale factors: `1`, `5`, `10`, `15`, `20`. Data lives in `substrait_test/{benchmark}/data/`. Plans are pre-generated Substrait protobuf via [isthmus-cli][isthmus] in `substrait_test/{benchmark}/plans/`.
+Scale factors: `1`, `5`, `10`, `15`, `20`. Data in `substrait_test/{benchmark}/data/`, plans (pre-generated via [isthmus-cli][isthmus]) in `substrait_test/{benchmark}/plans/`.
 
 ### EXPLAIN Plan Comparison
 

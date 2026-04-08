@@ -1,0 +1,251 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 680" width="920" height="680">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#555"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#009688"/>
+    </marker>
+    <marker id="arrow-signal" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#9e9e9e"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      .title { font-size: 14px; font-weight: 600; fill: #212121; }
+      .subtitle { font-size: 11px; font-weight: 500; fill: #424242; }
+      .label { font-size: 10.5px; fill: #555; }
+      .label-small { font-size: 9.5px; fill: #777; }
+      .heading { font-size: 16px; font-weight: 700; fill: #333; }
+      .signal-label { font-size: 9px; fill: #9e9e9e; font-style: italic; }
+      .legend-text { font-size: 9.5px; fill: #666; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="920" height="680" fill="#ffffff"/>
+
+  <!-- ============================================================ -->
+  <!-- ROW 1: Client -->
+  <!-- ============================================================ -->
+  <g id="client">
+    <rect x="320" y="20" width="280" height="52" rx="8" fill="#e8f4fd" stroke="#2196F3" stroke-width="1.5"/>
+    <text x="460" y="42" text-anchor="middle" class="title" fill="#1565C0">Flight SQL Client</text>
+    <text x="460" y="57" text-anchor="middle" class="label-small" fill="#1976D2">Python (pyarrow.flight) / C++ / ADBC</text>
+  </g>
+
+  <!-- Arrow: Client → gRPC -->
+  <line x1="460" y1="72" x2="460" y2="95" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ============================================================ -->
+  <!-- ROW 2: gRPC boundary -->
+  <!-- ============================================================ -->
+  <g id="grpc-boundary">
+    <line x1="60" y1="108" x2="860" y2="108" stroke="#FF9800" stroke-width="1.5" stroke-dasharray="8,4"/>
+    <rect x="300" y="96" width="320" height="24" rx="4" fill="#fff3e0" stroke="#FF9800" stroke-width="1"/>
+    <text x="460" y="112" text-anchor="middle" class="subtitle" fill="#E65100">gRPC (Arrow Flight SQL) — grpc://127.0.0.1:15432</text>
+  </g>
+
+  <!-- Arrow: gRPC → Server -->
+  <line x1="460" y1="120" x2="460" y2="178" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ============================================================ -->
+  <!-- ROW 3: PostgreSQL Extension container -->
+  <!-- ============================================================ -->
+  <g id="extension-container">
+    <rect x="30" y="145" width="860" height="480" rx="10" fill="#fafafa" stroke="#9e9e9e" stroke-width="1.5"/>
+    <text x="460" y="168" text-anchor="middle" class="heading">PostgreSQL Extension (arrow_flight_sql.so)</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- Main Process (left) -->
+  <!-- ============================================================ -->
+  <g id="main-process">
+    <rect x="50" y="185" width="210" height="175" rx="7" fill="#f3e5f5" stroke="#9C27B0" stroke-width="1.5"/>
+    <text x="155" y="207" text-anchor="middle" class="title" fill="#6A1B9A">Main Process</text>
+    <text x="155" y="223" text-anchor="middle" class="label-small" fill="#8E24AA">afs_main — Background Worker</text>
+    <line x1="65" y1="233" x2="245" y2="233" stroke="#CE93D8" stroke-width="0.5"/>
+    <text x="68" y="252" class="label">Init shared memory (DSA, dshash)</text>
+    <text x="68" y="270" class="label">Spawn Server + Executor workers</text>
+    <text x="68" y="288" class="label">Monitor executor health</text>
+    <text x="68" y="306" class="label">Coordinate session lifecycle</text>
+    <text x="68" y="324" class="label">Process request queues</text>
+    <text x="68" y="342" class="label">Signal routing (SIGUSR1)</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- Server Process (center) -->
+  <!-- ============================================================ -->
+  <g id="server-process">
+    <rect x="280" y="185" width="275" height="220" rx="7" fill="#e8f5e9" stroke="#4CAF50" stroke-width="1.5"/>
+    <text x="417" y="207" text-anchor="middle" class="title" fill="#2E7D32">Server Process</text>
+    <text x="417" y="223" text-anchor="middle" class="label-small" fill="#388E3C">afs_server — Background Worker</text>
+    <line x1="295" y1="233" x2="540" y2="233" stroke="#A5D6A7" stroke-width="0.5"/>
+
+    <!-- RPC Methods sub-box -->
+    <rect x="293" y="240" width="250" height="52" rx="4" fill="#c8e6c9" stroke="#66BB6A" stroke-width="0.8"/>
+    <text x="418" y="257" text-anchor="middle" class="subtitle" fill="#2E7D32">FlightSqlServerBase RPCs</text>
+    <text x="418" y="274" text-anchor="middle" class="label-small">GetFlightInfo · DoGet · DoPut · DoAction</text>
+
+    <!-- Auth -->
+    <text x="298" y="308" class="label">HeaderAuthServerMiddleware</text>
+    <text x="298" y="324" class="label-small">Basic auth → pg_hba.conf password check</text>
+    <text x="298" y="340" class="label-small">Bearer token → session lookup</text>
+
+    <!-- Proxy -->
+    <rect x="293" y="350" width="250" height="42" rx="4" fill="#c8e6c9" stroke="#66BB6A" stroke-width="0.8"/>
+    <text x="418" y="368" text-anchor="middle" class="subtitle" fill="#2E7D32">Proxy</text>
+    <text x="418" y="382" text-anchor="middle" class="label-small">Session management, executor dispatch</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- Executor Process (right) -->
+  <!-- ============================================================ -->
+  <g id="executor-process">
+    <rect x="575" y="185" width="300" height="305" rx="7" fill="#fff8e1" stroke="#FFC107" stroke-width="1.5"/>
+    <text x="725" y="207" text-anchor="middle" class="title" fill="#F57F17">Executor Process (per session)</text>
+    <text x="725" y="223" text-anchor="middle" class="label-small" fill="#F9A825">afs_executor — Background Worker</text>
+    <line x1="590" y1="233" x2="860" y2="233" stroke="#FFE082" stroke-width="0.5"/>
+
+    <text x="725" y="252" text-anchor="middle" class="label">PG Backend Connection</text>
+
+    <!-- SQL Path sub-box -->
+    <rect x="588" y="262" width="135" height="125" rx="5" fill="#fff3e0" stroke="#FF9800" stroke-width="1"/>
+    <text x="655" y="280" text-anchor="middle" class="subtitle" fill="#E65100">SQL Path</text>
+    <line x1="598" y1="287" x2="713" y2="287" stroke="#FFCC80" stroke-width="0.5"/>
+    <text x="655" y="303" text-anchor="middle" class="label">SPI_execute()</text>
+    <text x="655" y="319" text-anchor="middle" class="label-small">↓</text>
+    <text x="655" y="333" text-anchor="middle" class="label">SPI_tuptable</text>
+    <text x="655" y="349" text-anchor="middle" class="label-small">↓</text>
+    <text x="655" y="363" text-anchor="middle" class="label">Arrow batches</text>
+    <text x="655" y="379" text-anchor="middle" class="label-small">(materialized)</text>
+
+    <!-- Substrait Path sub-box -->
+    <rect x="733" y="262" width="135" height="165" rx="5" fill="#e0f2f1" stroke="#009688" stroke-width="1"/>
+    <text x="800" y="280" text-anchor="middle" class="subtitle" fill="#00695C">Substrait Path</text>
+    <line x1="743" y1="287" x2="858" y2="287" stroke="#80CBC4" stroke-width="0.5"/>
+    <text x="800" y="303" text-anchor="middle" class="label">substrait_to_query()</text>
+    <text x="800" y="319" text-anchor="middle" class="label-small">↓ Query* tree</text>
+    <text x="800" y="335" text-anchor="middle" class="label">standard_planner()</text>
+    <text x="800" y="351" text-anchor="middle" class="label-small">↓ PlannedStmt</text>
+    <text x="800" y="367" text-anchor="middle" class="label">ExecProcNode()</text>
+    <text x="800" y="383" text-anchor="middle" class="label-small">↓ streaming</text>
+    <text x="800" y="399" text-anchor="middle" class="label">Arrow batches</text>
+    <text x="800" y="415" text-anchor="middle" class="label-small">(no materialization)</text>
+
+    <!-- Write to ring buffer label -->
+    <text x="725" y="475" text-anchor="middle" class="label">write to Ring Buffer ↓</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- Shared Memory band -->
+  <!-- ============================================================ -->
+  <g id="shared-memory">
+    <rect x="50" y="510" width="825" height="95" rx="7" fill="#fce4ec" stroke="#E91E63" stroke-width="1.5"/>
+    <text x="462" y="532" text-anchor="middle" class="title" fill="#AD1457">Shared Memory (IPC)</text>
+    <line x1="65" y1="540" x2="860" y2="540" stroke="#F48FB1" stroke-width="0.5"/>
+
+    <!-- DSA -->
+    <rect x="68" y="548" width="150" height="40" rx="4" fill="#f8bbd0" stroke="#EC407A" stroke-width="0.8"/>
+    <text x="143" y="565" text-anchor="middle" class="subtitle" fill="#AD1457">DSA</text>
+    <text x="143" y="579" text-anchor="middle" class="label-small">Dynamic Shared Area</text>
+
+    <!-- dshash -->
+    <rect x="235" y="548" width="160" height="40" rx="4" fill="#f8bbd0" stroke="#EC407A" stroke-width="0.8"/>
+    <text x="315" y="565" text-anchor="middle" class="subtitle" fill="#AD1457">dshash Table</text>
+    <text x="315" y="579" text-anchor="middle" class="label-small">Session data index</text>
+
+    <!-- Ring Buffer -->
+    <rect x="412" y="548" width="195" height="40" rx="4" fill="#f8bbd0" stroke="#EC407A" stroke-width="0.8"/>
+    <text x="509" y="565" text-anchor="middle" class="subtitle" fill="#AD1457">Ring Buffer</text>
+    <text x="509" y="579" text-anchor="middle" class="label-small">8 MB per session (Arrow IPC)</text>
+
+    <!-- LWLocks -->
+    <rect x="625" y="548" width="120" height="40" rx="4" fill="#f8bbd0" stroke="#EC407A" stroke-width="0.8"/>
+    <text x="685" y="565" text-anchor="middle" class="subtitle" fill="#AD1457">LWLocks</text>
+    <text x="685" y="579" text-anchor="middle" class="label-small">Synchronization</text>
+
+    <!-- Signals label -->
+    <rect x="762" y="548" width="100" height="40" rx="4" fill="#f8bbd0" stroke="#EC407A" stroke-width="0.8"/>
+    <text x="812" y="565" text-anchor="middle" class="subtitle" fill="#AD1457">SIGUSR1</text>
+    <text x="812" y="579" text-anchor="middle" class="label-small">Process wakeup</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- Arrows: Process ↔ Shared Memory -->
+  <!-- ============================================================ -->
+
+  <!-- Main → Shared Memory -->
+  <line x1="155" y1="360" x2="155" y2="508" stroke="#9C27B0" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-signal)"/>
+
+  <!-- Server → Shared Memory -->
+  <line x1="418" y1="405" x2="418" y2="508" stroke="#4CAF50" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <text x="425" y="460" class="label-small" fill="#388E3C">query/plan ↓  ↑ results</text>
+
+  <!-- Executor → Shared Memory -->
+  <line x1="725" y1="490" x2="725" y2="508" stroke="#FFC107" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+  <!-- ============================================================ -->
+  <!-- Signal arrows (dashed) between processes -->
+  <!-- ============================================================ -->
+
+  <!-- Main → Server signal -->
+  <line x1="260" y1="250" x2="278" y2="250" stroke="#9e9e9e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-signal)"/>
+  <text x="268" y="242" class="signal-label">SIGUSR1</text>
+
+  <!-- Main → Executor signal -->
+  <line x1="260" y1="290" x2="573" y2="290" stroke="#9e9e9e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-signal)"/>
+  <text x="415" y="282" class="signal-label">SIGUSR1</text>
+
+  <!-- Server → Executor signal -->
+  <line x1="555" y1="370" x2="573" y2="370" stroke="#9e9e9e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-signal)"/>
+  <text x="563" y="362" class="signal-label">SIGUSR1</text>
+
+  <!-- ============================================================ -->
+  <!-- Return path: Arrow IPC back to client (thick teal) -->
+  <!-- ============================================================ -->
+  <g id="return-path">
+    <!-- Ring buffer → Server (up right side) -->
+    <path d="M 890 557 L 890 200 L 890 107 L 890 46 L 870 46"
+          fill="none" stroke="#009688" stroke-width="2.5" marker-end="url(#arrow-teal)"/>
+    <!-- Label along the return path -->
+    <text x="896" y="350" text-anchor="start" class="label" fill="#00695C"
+          transform="rotate(90, 896, 350)">Arrow Record Batches (IPC)</text>
+
+    <!-- Connector from shared mem to return path -->
+    <line x1="860" y1="557" x2="888" y2="557" stroke="#009688" stroke-width="2"/>
+
+    <!-- Connector at top back to client box -->
+    <line x1="600" y1="46" x2="888" y2="46" stroke="#009688" stroke-width="2.5"/>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- GUC Configuration note -->
+  <!-- ============================================================ -->
+  <g id="config-note">
+    <rect x="50" y="630" width="520" height="38" rx="5" fill="#f5f5f5" stroke="#bdbdbd" stroke-width="0.8"/>
+    <text x="60" y="648" class="label-small" fill="#616161">GUC Parameters:</text>
+    <text x="60" y="661" class="label-small" fill="#888">uri · session_timeout · max_sessions · ring_buffer_size · max_n_rows_per_record_batch · ipc_compression · explain</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- Legend -->
+  <!-- ============================================================ -->
+  <g id="legend">
+    <rect x="620" y="630" width="270" height="38" rx="5" fill="#f5f5f5" stroke="#bdbdbd" stroke-width="0.8"/>
+
+    <!-- Solid arrow -->
+    <line x1="632" y1="645" x2="656" y2="645" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <text x="668" y="648" class="legend-text">Data flow</text>
+
+    <!-- Dashed arrow -->
+    <line x1="730" y1="645" x2="754" y2="645" stroke="#9e9e9e" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-signal)"/>
+    <text x="766" y="648" class="legend-text">SIGUSR1</text>
+
+    <!-- Thick teal -->
+    <line x1="632" y1="660" x2="656" y2="660" stroke="#009688" stroke-width="2.5" marker-end="url(#arrow-teal)"/>
+    <text x="668" y="663" class="legend-text">Arrow IPC return path</text>
+  </g>
+</svg>
