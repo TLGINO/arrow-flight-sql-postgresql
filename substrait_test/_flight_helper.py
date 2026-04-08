@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Long-running Flight SQL helper: reads plan/SQL from stdin, writes Arrow IPC
-results to stdout. Reuses a single Flight SQL client/session across all queries.
-Reconnects automatically on auth errors.
+results to stdout. Reuses a single ADBC Flight SQL connection across all queries.
+Reconnects automatically on errors.
 
 Protocol (binary on stdin/stdout):
   IN:  b"PLAN <nbytes>\n" + <plan_bytes>     # execute Substrait plan
@@ -11,73 +11,51 @@ Protocol (binary on stdin/stdout):
   OUT: b"ERR <message>\n"                     # error
   IN:  b"\n" or EOF → exit
 """
+import os
 import sys
 import traceback
 
-import os
-
 import pyarrow as pa
-import pyarrow.flight as flight
 import pyarrow.ipc as ipc
+
+import adbc_driver_flightsql.dbapi as flightsql
 
 FLIGHT_URI = os.environ.get("FLIGHT_URI", "grpc://127.0.0.1:15432")
 FLIGHT_USER = os.environ.get("PGUSER", os.environ.get("USER", "postgres"))
 FLIGHT_PASSWORD = os.environ.get("FLIGHT_PASSWORD", "")
-
-
-def varint(v):
-    r = []
-    while v > 0x7F:
-        r.append((v & 0x7F) | 0x80)
-        v >>= 7
-    r.append(v & 0x7F)
-    return bytes(r)
-
-
-def pb_field(n, data):
-    return varint((n << 3) | 2) + varint(len(data)) + data
+FLIGHT_DATABASE = os.environ.get("PGDATABASE", "postgres")
 
 
 class FlightHelper:
     def __init__(self):
-        self.client = None
-        self.options = None
+        self.conn = None
 
     def connect(self):
-        if self.client:
+        if self.conn:
             try:
-                self.client.close()
+                self.conn.close()
             except Exception:
                 pass
-        self.client = flight.FlightClient(FLIGHT_URI)
-        token_pair = self.client.authenticate_basic_token(FLIGHT_USER, FLIGHT_PASSWORD)
-        self.options = flight.FlightCallOptions(headers=[token_pair])
+        self.conn = flightsql.connect(
+            FLIGHT_URI,
+            db_kwargs={
+                "username": FLIGHT_USER,
+                "password": FLIGHT_PASSWORD,
+                "adbc.flight.sql.rpc.call_header.x-flight-sql-database": FLIGHT_DATABASE,
+            },
+        )
 
     def execute(self, plan_bytes):
-        cmd = pb_field(
-            1,
-            b"type.googleapis.com/arrow.flight.protocol.sql"
-            b".CommandStatementSubstraitPlan",
-        ) + pb_field(2, pb_field(1, pb_field(1, plan_bytes)))
-
-        info = self.client.get_flight_info(
-            flight.FlightDescriptor.for_command(cmd), self.options
-        )
-        reader = self.client.do_get(info.endpoints[0].ticket, self.options)
-        return reader.read_all()
+        with self.conn.cursor() as cur:
+            cur.adbc_statement.set_substrait_plan(plan_bytes)
+            handle, _ = cur.adbc_statement.execute_query()
+            reader = pa.RecordBatchReader.from_stream(handle)
+            return reader.read_all()
 
     def execute_sql(self, query):
-        cmd = pb_field(
-            1,
-            b"type.googleapis.com/arrow.flight.protocol.sql"
-            b".CommandStatementQuery",
-        ) + pb_field(2, pb_field(1, query.encode("utf-8")))
-
-        info = self.client.get_flight_info(
-            flight.FlightDescriptor.for_command(cmd), self.options
-        )
-        reader = self.client.do_get(info.endpoints[0].ticket, self.options)
-        return reader.read_all()
+        with self.conn.cursor() as cur:
+            cur.execute(query)
+            return cur.fetch_arrow_table()
 
 
 def read_exact(stream, n):
@@ -122,7 +100,7 @@ def main():
                 plan_bytes = read_exact(stdin, nbytes)
                 try:
                     table = helper.execute(plan_bytes)
-                except flight.FlightUnauthorizedError:
+                except Exception:
                     helper.connect()
                     table = helper.execute(plan_bytes)
             elif text.startswith("SQL "):
@@ -130,7 +108,7 @@ def main():
                 sql = read_exact(stdin, nbytes).decode("utf-8")
                 try:
                     table = helper.execute_sql(sql)
-                except flight.FlightUnauthorizedError:
+                except Exception:
                     helper.connect()
                     table = helper.execute_sql(sql)
             else:
@@ -146,9 +124,10 @@ def main():
             msg = traceback.format_exc().strip().split("\n")[-1]
             stdout.write(f"ERR {msg}\n".encode())
             stdout.flush()
+            helper.connect()  # fresh session for next query
 
-    if helper.client:
-        helper.client.close()
+    if helper.conn:
+        helper.conn.close()
 
 
 if __name__ == "__main__":

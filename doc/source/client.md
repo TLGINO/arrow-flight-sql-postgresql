@@ -105,9 +105,31 @@ to get results.
 ```
 ````
 
-```{tab} ADBC Flight SQL driver
-TODO
+````{tab} ADBC Flight SQL driver (Python)
+Use [`adbc_driver_flightsql`][arrow-adbc-flightsql-python]
+(`pip install adbc-driver-flightsql`).
+
+`cursor.execute()` runs the query.
+`cursor.fetch_arrow_table()` returns results as an Arrow table.
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect(
+    "grpc://127.0.0.1:15432",
+    db_kwargs={
+        "username": "postgres",
+        "password": "",
+        "adbc.flight.sql.rpc.call_header.x-flight-sql-database": "postgres",
+    },
+)
+with conn.cursor() as cur:
+    cur.execute("SELECT 1 AS n, 'hello' AS greeting")
+    table = cur.fetch_arrow_table()
+    print(table.to_pandas())
+conn.close()
 ```
+````
 
 ### Prepared SQL statement
 
@@ -137,10 +159,21 @@ to get results.
 ```
 ````
 
-```{tab} ADBC Flight SQL driver
-TODO
-```
+````{tab} ADBC Flight SQL driver (Python)
+Use `cursor.adbc_prepare()` to prepare the statement.
+Pass parameters as a PyArrow `RecordBatch` via `cursor.executemany()`,
+or execute directly with `cursor.execute()`.
 
+```python
+with conn.cursor() as cur:
+    cur.adbc_prepare("SELECT $1::int AS n, $2::text AS greeting")
+    cur.execute("SELECT $1::int AS n, $2::text AS greeting", parameters=(42, "world"))
+    table = cur.fetch_arrow_table()
+    print(table.to_pandas())
+```
+````
+
+[arrow-adbc-flightsql-python]: https://arrow.apache.org/adbc/current/driver/flight_sql.html
 [arrow-adbc-authentication]: https://arrow.apache.org/adbc/current/driver/flight_sql.html#authentication
 [arrow-adbc-custom-call-headers]: https://arrow.apache.org/adbc/current/driver/flight_sql.html#custom-call-headers
 [arrow-flight-authenticate-basic]: https://arrow.apache.org/docs/cpp/api/flight.html#clients

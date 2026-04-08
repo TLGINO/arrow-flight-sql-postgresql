@@ -60,53 +60,35 @@ The adapter starts a gRPC server on `grpc://127.0.0.1:15432`. Authentication use
 
 ### 2. Run a SQL Query
 
+Uses [ADBC Flight SQL driver][adbc] (`pip install adbc-driver-flightsql`):
+
 ```python
-import pyarrow.flight as flight
+import adbc_driver_flightsql.dbapi as flightsql
 
-client = flight.FlightClient("grpc://127.0.0.1:15432")
-token = client.authenticate_basic_token("postgres", "")
-opts = flight.FlightCallOptions(headers=[token])
-
-# protobuf wire helpers (tag + length-delimited field)
-def varint(v):
-    r = []
-    while v > 0x7F:
-        r.append((v & 0x7F) | 0x80); v >>= 7
-    r.append(v & 0x7F)
-    return bytes(r)
-
-def pb(n, data):
-    return varint((n << 3) | 2) + varint(len(data)) + data
-
-sql = "SELECT 1 AS n, 'hello' AS greeting"
-cmd = pb(1, b"type.googleapis.com/arrow.flight.protocol.sql"
-            b".CommandStatementQuery") \
-    + pb(2, pb(1, sql.encode()))
-
-info = client.get_flight_info(flight.FlightDescriptor.for_command(cmd), opts)
-reader = client.do_get(info.endpoints[0].ticket, opts)
-print(reader.read_all().to_pandas())
-#    n greeting
-# 0  1    hello
+conn = flightsql.connect(
+    "grpc://127.0.0.1:15432",
+    db_kwargs={"username": "postgres", "password": ""},
+)
+with conn.cursor() as cur:
+    cur.execute("SELECT 1 AS n, 'hello' AS greeting")
+    print(cur.fetch_arrow_table().to_pandas())
+    #    n greeting
+    # 0  1    hello
+conn.close()
 ```
 
 ### 3. Execute a Substrait Plan
 
 ```python
-# read a pre-generated Substrait plan (binary protobuf)
 with open("substrait_test/tpch/plans/01.proto", "rb") as f:
     plan_bytes = f.read()
 
-# wrap in Flight SQL CommandStatementSubstraitPlan
-cmd = pb(1, b"type.googleapis.com/arrow.flight.protocol.sql"
-            b".CommandStatementSubstraitPlan") \
-    + pb(2, pb(1, pb(1, plan_bytes)))
-
-info = client.get_flight_info(flight.FlightDescriptor.for_command(cmd), opts)
-reader = client.do_get(info.endpoints[0].ticket, opts)
-table = reader.read_all()
-print(f"{table.num_rows} rows, {table.num_columns} cols")
-print(table.to_pandas().head())
+with conn.cursor() as cur:
+    cur.adbc_statement.set_substrait_plan(plan_bytes)
+    cur.adbc_statement.execute_query()
+    table = cur.fetch_arrow_table()
+    print(f"{table.num_rows} rows, {table.num_columns} cols")
+    print(table.to_pandas().head())
 ```
 
 Plans are pre-generated Substrait protobuf via [isthmus-cli][isthmus]. See `substrait_test/{tpch,tpcds}/plans/` for all TPC-H and TPC-DS plans.
@@ -185,5 +167,6 @@ Apache License 2.0. See [LICENSE.txt](LICENSE.txt).
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 [flight-sql]: https://arrow.apache.org/docs/format/FlightSql.html
+[adbc]: https://arrow.apache.org/adbc/
 [substrait]: https://substrait.io/
 [isthmus]: https://github.com/substrait-io/substrait-java
