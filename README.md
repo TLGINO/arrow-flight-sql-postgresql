@@ -1,9 +1,9 @@
 # Apache Arrow Flight SQL + Substrait Adapter for PostgreSQL
 
-PostgreSQL extension that receives [Substrait][substrait] plans over [Arrow Flight SQL][flight-sql], converts them to PostgreSQL Query trees, executes via `standard_planner`, and returns Arrow record batches.
+PostgreSQL extension that serves SQL queries, [Substrait][substrait] plans, and bidirectional data exchange (`DoExchange`) over [Arrow Flight SQL][flight-sql]. Substrait plans are converted to PostgreSQL Query trees and executed via `standard_planner`. Includes an FDW for querying remote Flight SQL servers.
 
 ```
-Flight SQL gRPC → Substrait protobuf → PG Query* → standard_planner → executor → Arrow batches
+Client (ADBC) → gRPC → {SQL | Substrait | DoExchange} → PG executor → Arrow batches
 ```
 
 ## Architecture
@@ -16,15 +16,15 @@ Flight SQL gRPC → Substrait protobuf → PG Query* → standard_planner → ex
 
 | Relation | Notes |
 |---|---|
-| ReadRel | Named tables, virtual tables (VALUES) |
-| FilterRel | WHERE clauses |
-| ProjectRel | Projections, window functions |
-| AggregateRel | GROUP BY, ROLLUP/CUBE (via SetRel), DISTINCT aggregates |
-| SortRel | ASC/DESC, NULLS FIRST/LAST |
-| FetchRel | LIMIT/OFFSET |
-| JoinRel | INNER, LEFT, RIGHT, FULL |
-| CrossRel | Flattened to multi-table FROM |
-| SetRel | UNION/INTERSECT/EXCEPT, ALL/DISTINCT |
+| `ReadRel` | Named tables, virtual tables (VALUES) |
+| `FilterRel` | WHERE clauses |
+| `ProjectRel` | Projections, window functions |
+| `AggregateRel` | GROUP BY, ROLLUP/CUBE (via SetRel), DISTINCT aggregates |
+| `SortRel` | ASC/DESC, NULLS FIRST/LAST |
+| `FetchRel` | LIMIT/OFFSET |
+| `JoinRel` | INNER, LEFT, RIGHT, FULL |
+| `CrossRel` | Flattened to multi-table FROM |
+| `SetRel` | UNION/INTERSECT/EXCEPT, ALL/DISTINCT |
 
 ### SQL Features
 
@@ -33,6 +33,32 @@ Flight SQL gRPC → Substrait protobuf → PG Query* → standard_planner → ex
 - CTE deduplication (auto-detected duplicate subtrees)
 - `CASE`/`WHEN`, `COALESCE`, `CAST`
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`, `BOOL_AND`/`OR`
+
+## DoExchange (Bidirectional Streaming)
+
+`DoExchange` RPC: client sends Arrow data + SQL query, server builds a CTE (`_exchange_input`) from the data, executes the query, returns results.
+
+```sql
+-- Server constructs:
+WITH _exchange_input("col1", "col2") AS (VALUES (...))
+SELECT col1, SUM(col2) FROM _exchange_input GROUP BY col1
+```
+
+## Foreign Data Wrapper
+
+FDW for querying remote Flight SQL servers via foreign tables (`src/fdw.cc`).
+
+```sql
+CREATE SERVER remote FOREIGN DATA WRAPPER arrow_flight_sql
+  OPTIONS (uri 'grpc://remote:15432');
+CREATE USER MAPPING FOR CURRENT_USER SERVER remote
+  OPTIONS (username 'user', password 'pass');
+CREATE FOREIGN TABLE t1 (id int, name text)
+  SERVER remote OPTIONS (table_name 'public.t1');
+SELECT * FROM t1 WHERE id > 10;
+```
+
+Options: `table_name` (remote table) or `query` (arbitrary SQL). Uses `FlightClientPool` for connection reuse.
 
 ## Build
 
@@ -44,7 +70,7 @@ ninja -C builddir
 sudo ninja -C builddir install
 ```
 
-Installs `arrow_flight_sql.so` into the PostgreSQL `pkglibdir`.
+Compiles `afs.cc`, `fdw.cc`, `flight_client.cc` into `arrow_flight_sql.so` (PostgreSQL `pkglibdir`).
 
 ## Quick Start
 
@@ -119,10 +145,10 @@ shared_preload_libraries = 'arrow_flight_sql'
 Correctness is verified by running each query through three independent execution paths and comparing results row-by-row:
 
 1. **PG ground truth** — native `psql` CSV output (the reference)
-2. **Arrow Flight SQL** — same SQL sent over Flight SQL, returned as Arrow batches
-3. **Substrait** — pre-generated binary Substrait plan sent over Flight SQL
+2. **Arrow Flight SQL** — SQL via ADBC `cursor.execute(sql)` → `fetch_arrow_table()`
+3. **Substrait** — binary plan via ADBC `cursor.execute(plan_bytes)` → `fetch_arrow_table()`
 
-All three paths must produce identical results after normalization (floats rounded to 4 decimals, dates to ISO, nulls unified). The `--run` bitmask selects which paths to execute: `4`=pgsql, `2`=arrow, `1`=substrait (default `5`=pgsql+substrait, `7`=all three).
+All three paths must produce identical results after normalization (floats rounded to 4 decimals, dates to ISO, nulls unified). Both Flight SQL paths share an ADBC connection. The test sets `session_timeout=-1` to prevent timeouts. The `--run` bitmask selects which paths to execute: `4`=pgsql, `2`=arrow, `1`=substrait (default `5`=pgsql+substrait, `7`=all three).
 
 TPC-H: 22 queries, 22 pass. TPC-DS: 99 queries, 98 pass.
 
@@ -145,6 +171,12 @@ python3 substrait_test/plot_explain.py tpch
 ```
 
 `--explain` bitmask: 4=pgsql, 2=arrow, 1=substrait (7=all). Sets `--run` automatically when `--run` not given. Plans are written as individual JSON files per query per method in `substrait_test/explain/{benchmark}_sf{sf}/`. The HTML viewer shows query tabs, SF sub-tabs, and parallel worker badges (G=gather, W=worker).
+
+### DoExchange & FDW Tests
+
+```sh
+python3 -m pytest test_exchange_fdw/ -v
+```
 
 ### Performance
 
