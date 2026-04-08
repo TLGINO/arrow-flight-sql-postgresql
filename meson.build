@@ -94,7 +94,7 @@ if host_machine.system() == 'darwin' and \
 endif
 afs = shared_module(
   'arrow_flight_sql',
-  ['src/afs.cc'] + substrait_sources,
+  ['src/afs.cc', 'src/flight_client.cc', 'src/fdw.cc'] + substrait_sources,
   cpp_args: cpp_args + substrait_inc_args,
   dependencies: [arrow_flight_sql, postgresql, protobuf],
   name_prefix: '',

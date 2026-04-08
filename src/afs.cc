@@ -464,6 +464,8 @@ enum class Action
 	SelectPreparedStatement,
 	UpdatePreparedStatement,
 	SubstraitSelect,
+	DoExchange,
+	CloseSession,
 };
 
 const char*
@@ -489,6 +491,10 @@ action_name(Action action)
 			return "Action::UpdatePreparedStatement";
 		case Action::SubstraitSelect:
 			return "Action::SubstraitSelect";
+		case Action::DoExchange:
+			return "Action::DoExchange";
+		case Action::CloseSession:
+			return "Action::CloseSession";
 		default:
 			return "Action::Unknown";
 	}
@@ -576,6 +582,8 @@ struct SharedSessionData {
 	bool setParametersFinished;
 	dsa_pointer substraitPlan;
 	size_t substraitPlanSize;
+	dsa_pointer exchangeQuery;
+	bool exchangeFinished;
 	SharedRingBufferData bufferData;
 };
 
@@ -611,6 +619,8 @@ shared_session_data_initialize(SharedSessionData* session,
 	session->setParametersFinished = false;
 	session->substraitPlan = InvalidDsaPointer;
 	session->substraitPlanSize = 0;
+	session->exchangeQuery = InvalidDsaPointer;
+	session->exchangeFinished = false;
 	SharedRingBuffer::initialize_data(&(session->bufferData));
 }
 
@@ -637,6 +647,8 @@ shared_session_data_finalize(SharedSessionData* session, dsa_area* area)
 		dsa_free(area, session->clientAddress);
 	if (DsaPointerIsValid(session->substraitPlan))
 		dsa_free(area, session->substraitPlan);
+	if (DsaPointerIsValid(session->exchangeQuery))
+		dsa_free(area, session->exchangeQuery);
 	SharedRingBuffer::free_data(&(session->bufferData), area);
 }
 
@@ -1226,6 +1238,13 @@ class ArrowArrayBuilder<ArrowType, arrow::enable_if_has_c_type<ArrowType>>
 		       (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE);
 	}
 
+	template <typename TargetArrowType>
+	std::enable_if_t<std::is_same_v<TargetArrowType, arrow::BooleanType>, bool>
+	convert_value(Datum datum)
+	{
+		return DatumGetBool(datum);
+	}
+
 };
 
 template <typename ArrowType>
@@ -1330,6 +1349,9 @@ ArrowArrayBuilderBase::make(Form_pg_attribute attribute,
 {
 	switch (attribute->atttypid)
 	{
+		case BOOLOID:
+			return std::make_unique<ArrowArrayBuilder<arrow::BooleanType>>(
+				attribute, iAttribute, builder);
 		case INT2OID:
 			return std::make_unique<ArrowArrayBuilder<arrow::Int16Type>>(
 				attribute, iAttribute, builder);
@@ -1373,6 +1395,8 @@ ArrowArrayBuilderBase::arrow_type(Form_pg_attribute attribute)
 {
 	switch (attribute->atttypid)
 	{
+		case BOOLOID:
+			return arrow::boolean();
 		case INT2OID:
 			return arrow::int16();
 		case INT4OID:
@@ -1758,6 +1782,12 @@ class Executor : public WorkerProcessor {
 					break;
 				case Action::SubstraitSelect:
 					select_substrait();
+					break;
+				case Action::DoExchange:
+					do_exchange();
+					break;
+				case Action::CloseSession:
+					GotSIGTERM = true;
 					break;
 				default:
 				{
@@ -2368,6 +2398,278 @@ class Executor : public WorkerProcessor {
 				tag);
 			dshash_release_lock(sessions_, session);
 
+			signal_server(tag);
+		}
+	}
+
+	void do_exchange()
+	{
+		const char* tag = "do_exchange";
+		pgstat_report_activity(
+			STATE_RUNNING,
+			(std::string(Tag) + ": exchanging").c_str());
+
+		auto session = find_session();
+		if (!DsaPointerIsValid(session->exchangeQuery))
+		{
+			set_error_message(
+				session,
+				std::string(Tag) + ": " + tag_ + ": " + tag +
+					": exchange query is missing",
+				tag);
+			dshash_release_lock(sessions_, session);
+			signal_server(tag);
+			return;
+		}
+
+		std::string query;
+		{
+			ProcessorLockGuard lock(this);
+			query =
+				static_cast<const char*>(dsa_get_address(area_, session->exchangeQuery));
+			dsa_free(area_, session->exchangeQuery);
+			session->exchangeQuery = InvalidDsaPointer;
+		}
+		dshash_release_lock(sessions_, session);
+		P("%s: %s: %s: %s", Tag, tag_, tag, query.c_str());
+
+		// Phase 1: Read all client data from ring buffer into memory
+		std::shared_ptr<arrow::Schema> inputSchema;
+		std::vector<std::shared_ptr<arrow::RecordBatch>> inputBatches;
+		{
+			auto input = std::make_shared<SharedRingBufferInputStream>(
+				this, localSession_);
+			auto readerResult =
+				arrow::ipc::RecordBatchStreamReader::Open(input);
+			if (!readerResult.ok())
+			{
+				session = find_session();
+				set_error_message(
+					session,
+					std::string(Tag) + ": " + tag_ + ": " + tag +
+						": failed to open input: " + readerResult.status().ToString(),
+					tag);
+				session->exchangeFinished = true;
+				dshash_release_lock(sessions_, session);
+				signal_server(tag);
+				return;
+			}
+			auto reader = *std::move(readerResult);
+			inputSchema = reader->schema();
+			int64_t totalRows = 0;
+			while (true)
+			{
+				auto batchResult = reader->Next();
+				if (!batchResult.ok()) break;
+				auto batch = *batchResult;
+				if (!batch) break;
+				totalRows += batch->num_rows();
+				if (totalRows > MaxNRowsPerRecordBatch)
+				{
+					session = find_session();
+					set_error_message(
+						session,
+						std::string(Tag) + ": " + tag_ + ": " + tag +
+							": exchange input exceeds row limit ("
+							+ std::to_string(MaxNRowsPerRecordBatch) + ")",
+						tag);
+					session->exchangeFinished = true;
+					dshash_release_lock(sessions_, session);
+					signal_server(tag);
+					return;
+				}
+				inputBatches.push_back(batch);
+			}
+		}
+		P("%s: %s: %s: read %zu batches", Tag, tag_, tag, inputBatches.size());
+
+		// Phase 2: Build CTE from client data and execute query
+		{
+			ScopedTransaction scopedTransaction;
+			ScopedSnapshot scopedSnapshot;
+
+			SetCurrentStatementStartTimestamp();
+			SPI_connect();
+			needFinish_ = true;
+
+			std::string finalSQL;
+			int64_t totalInputRows = 0;
+			for (auto& b : inputBatches)
+				totalInputRows += b->num_rows();
+
+			if (inputSchema && inputSchema->num_fields() > 0 && totalInputRows > 0)
+			{
+				// Build CTE: WITH _exchange_input(col1,col2,...) AS (VALUES ...)
+				std::string cte = "WITH _exchange_input(";
+				for (int i = 0; i < inputSchema->num_fields(); i++)
+				{
+					if (i > 0) cte += ", ";
+					auto fname = inputSchema->field(i)->name();
+					std::string escaped_name;
+					for (char c : fname)
+					{
+						if (c == '"') escaped_name += "\"\"";
+						else escaped_name += c;
+					}
+					cte += "\"" + escaped_name + "\"";
+				}
+				cte += ") AS (VALUES ";
+
+				bool firstRow = true;
+				for (auto& batch : inputBatches)
+				{
+					for (int64_t row = 0; row < batch->num_rows(); row++)
+					{
+						if (!firstRow) cte += ", ";
+						firstRow = false;
+						cte += "(";
+						for (int col = 0; col < batch->num_columns(); col++)
+						{
+							if (col > 0) cte += ", ";
+							auto arr = batch->column(col);
+							if (arr->IsNull(row))
+							{
+								cte += "NULL";
+								continue;
+							}
+							auto scalarResult = arr->GetScalar(row);
+							if (!scalarResult.ok())
+							{
+								cte += "NULL";
+								continue;
+							}
+							auto scalar = *scalarResult;
+							auto val = scalar->ToString();
+							// Escape single quotes
+							std::string escaped;
+							for (char c : val)
+							{
+								if (c == '\'') escaped += "''";
+								else escaped += c;
+							}
+							// Cast to appropriate PG type
+							switch (arr->type_id())
+							{
+								case arrow::Type::INT16:
+									cte += escaped + "::smallint";
+									break;
+								case arrow::Type::INT32:
+									cte += escaped + "::integer";
+									break;
+								case arrow::Type::INT64:
+									cte += escaped + "::bigint";
+									break;
+								case arrow::Type::FLOAT:
+									cte += escaped + "::real";
+									break;
+								case arrow::Type::DOUBLE:
+									cte += escaped + "::double precision";
+									break;
+								case arrow::Type::BOOL:
+									cte += escaped + "::boolean";
+									break;
+								case arrow::Type::STRING:
+								case arrow::Type::LARGE_STRING:
+									cte += "'" + escaped + "'";
+									break;
+								case arrow::Type::DATE32:
+									cte += "'" + escaped + "'::date";
+									break;
+								case arrow::Type::TIMESTAMP:
+									cte += "'" + escaped + "'::timestamp";
+									break;
+								case arrow::Type::DECIMAL128:
+									cte += escaped + "::numeric";
+									break;
+								default:
+									cte += "'" + escaped + "'";
+									break;
+							}
+						}
+						cte += ")";
+					}
+				}
+				cte += ") ";
+				finalSQL = cte + query;
+			}
+			else if (inputSchema && inputSchema->num_fields() > 0 && totalInputRows == 0)
+			{
+				// Empty input: build CTE with correct columns but no rows
+				std::string cte = "WITH _exchange_input AS (SELECT ";
+				for (int i = 0; i < inputSchema->num_fields(); i++)
+				{
+					if (i > 0) cte += ", ";
+					// NULL cast to appropriate type
+					std::string pgType = "text";
+					switch (inputSchema->field(i)->type()->id())
+					{
+						case arrow::Type::INT16:  pgType = "smallint"; break;
+						case arrow::Type::INT32:  pgType = "integer"; break;
+						case arrow::Type::INT64:  pgType = "bigint"; break;
+						case arrow::Type::FLOAT:  pgType = "real"; break;
+						case arrow::Type::DOUBLE: pgType = "double precision"; break;
+						case arrow::Type::BOOL:   pgType = "boolean"; break;
+						case arrow::Type::STRING:
+						case arrow::Type::LARGE_STRING: pgType = "text"; break;
+						case arrow::Type::DATE32: pgType = "date"; break;
+						case arrow::Type::TIMESTAMP: pgType = "timestamp"; break;
+						case arrow::Type::DECIMAL128: pgType = "numeric"; break;
+						default: pgType = "text"; break;
+					}
+					auto fname = inputSchema->field(i)->name();
+					std::string escaped_name;
+					for (char c : fname)
+					{
+						if (c == '"') escaped_name += "\"\"";
+						else escaped_name += c;
+					}
+					cte += "NULL::" + pgType + " AS \"" + escaped_name + "\"";
+				}
+				cte += " WHERE false) ";
+				finalSQL = cte + query;
+			}
+			else
+			{
+				finalSQL = query;
+			}
+			P("%s: %s: %s: sql: %s", Tag, tag_, tag, finalSQL.c_str());
+
+			auto result = SPI_execute(finalSQL.c_str(), true, 0);
+			if (result > 0)
+			{
+				pgstat_report_activity(
+					STATE_RUNNING,
+					(std::string(Tag) + ": " + tag + ": writing").c_str());
+				auto status = write_record_batches(tag);
+				if (!status.ok())
+				{
+					session = find_session();
+					set_error_message(
+						session,
+						std::string(Tag) + ": " + tag_ + ": " + tag +
+							": failed to write: " + status.ToString(),
+						tag);
+					dshash_release_lock(sessions_, session);
+				}
+			}
+			else
+			{
+				session = find_session();
+				set_error_message(
+					session,
+					std::string(Tag) + ": " + tag_ + ": " + tag +
+						": failed to run query: <" + finalSQL +
+						">: " + SPI_result_code_string(result),
+					tag);
+				dshash_release_lock(sessions_, session);
+			}
+
+			SPI_finish();
+			needFinish_ = false;
+
+			session = find_session();
+			session->exchangeFinished = true;
+			dshash_release_lock(sessions_, session);
 			signal_server(tag);
 		}
 	}
@@ -2988,7 +3290,9 @@ class Proxy : public WorkerProcessor {
 		  selectPreparedStatementRequests_(),
 		  updatePreparedStatementRequests_(),
 		  readRequests_(),
-		  writeRequests_()
+		  writeRequests_(),
+		  doExchangeRequests_(),
+		  closeSessionRequests_()
 	{
 	}
 
@@ -3034,6 +3338,8 @@ class Proxy : public WorkerProcessor {
 		process_update_prepared_statement_requests();
 		process_read_requests();
 		process_write_requests();
+		process_do_exchange_requests();
+		process_close_session_requests();
 		sync_sessions();
 		conditionVariable_.notify_all();
 	}
@@ -3251,7 +3557,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -3398,7 +3704,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -3439,7 +3745,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -3553,7 +3859,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -3668,7 +3974,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -3785,7 +4091,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -3919,7 +4225,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -4004,7 +4310,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -4145,7 +4451,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -4229,7 +4535,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -4327,7 +4633,7 @@ class Proxy : public WorkerProcessor {
 			std::unique_lock<std::mutex> lock(mutex_);
 			if (!conditionVariable_.wait_for(
 					lock,
-					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 					[&] {
 						if (localSession->errorMessage.has_value())
 						{
@@ -4346,6 +4652,237 @@ class Proxy : public WorkerProcessor {
 		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
 		CHECK_FOR_INTERRUPTS();
 		return request->writtenBytes;
+	}
+
+	struct DoExchangeRequest {
+		DoExchangeRequest(std::shared_ptr<LocalSessionData> localSession,
+		                  std::string query)
+			: localSession(std::move(localSession)),
+			  query(std::move(query)),
+			  processing(false),
+			  finished(false)
+		{
+		}
+		std::shared_ptr<LocalSessionData> localSession;
+		std::string query;
+		bool processing;
+		bool finished;
+	};
+
+	std::list<std::shared_ptr<DoExchangeRequest>> doExchangeRequests_;
+
+	struct CloseSessionRequest {
+		CloseSessionRequest(uint64_t sessionId)
+			: sessionId(sessionId),
+			  finished(false)
+		{
+		}
+		uint64_t sessionId;
+		bool finished;
+	};
+
+	std::list<std::shared_ptr<CloseSessionRequest>> closeSessionRequests_;
+
+	// Can use PostgreSQL API.
+	void process_close_session_requests()
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (auto it = closeSessionRequests_.begin();
+		     it != closeSessionRequests_.end();)
+		{
+			auto& request = *it;
+			auto session = static_cast<SharedSessionData*>(
+				dshash_find(sessions_, &(request->sessionId), false));
+			if (!session)
+			{
+				request->finished = true;
+				it = closeSessionRequests_.erase(it);
+				continue;
+			}
+			auto executorPID = session->executorPID;
+			{
+				SharedSessionReleaser sessionReleaser(sessions_, session);
+				ProcessorLockGuard lock(this);
+				session->action = Action::CloseSession;
+			}
+			P("%s: %s: %s: kill executor: %d", Tag, tag_, tag, executorPID);
+			kill(executorPID, SIGUSR1);
+			request->finished = true;
+			it = closeSessionRequests_.erase(it);
+		}
+	}
+
+	// Can use PostgreSQL API.
+	void process_do_exchange_requests()
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (auto it = doExchangeRequests_.begin();
+		     it != doExchangeRequests_.end();)
+		{
+			auto& request = *it;
+			auto session = static_cast<SharedSessionData*>(
+				dshash_find(sessions_, &(request->localSession->id), false));
+			if (!session)
+			{
+				request->finished = true;
+				request->localSession->errorMessage =
+					std::string("stolen session: ") +
+					std::to_string(request->localSession->id);
+				it = doExchangeRequests_.erase(it);
+				continue;
+			}
+			if (request->processing)
+			{
+				SharedSessionReleaser sessionReleaser(sessions_, session);
+				if (DsaPointerIsValid(session->errorMessage))
+				{
+					request->processing = false;
+					request->finished = true;
+					it = doExchangeRequests_.erase(it);
+				}
+				else if (session->exchangeFinished)
+				{
+					request->processing = false;
+					request->finished = true;
+					it = doExchangeRequests_.erase(it);
+				}
+				else
+				{
+					++it;
+				}
+			}
+			else
+			{
+				auto executorPID = session->executorPID;
+				{
+					SharedSessionReleaser sessionReleaser(sessions_, session);
+					ProcessorLockGuard lock(this);
+					set_shared_string(session->exchangeQuery, request->query);
+					session->action = Action::DoExchange;
+					session->exchangeFinished = false;
+				}
+				P("%s: %s: %s: kill executor: %d", Tag, tag_, tag, executorPID);
+				kill(executorPID, SIGUSR1);
+				request->processing = true;
+				++it;
+			}
+		}
+	}
+
+   public:
+	// Don't use PostgreSQL API.
+	arrow::Status do_exchange(uint64_t sessionID,
+	                          const std::string& query,
+	                          arrow::flight::FlightMessageReader* reader,
+	                          arrow::flight::FlightMessageWriter* writer)
+	{
+		const char* tag __attribute__((unused)) = "do_exchange";
+		ARROW_ASSIGN_OR_RAISE(auto localSession, find_session(sessionID));
+		auto request = std::make_shared<DoExchangeRequest>(localSession, query);
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			doExchangeRequests_.push_back(request);
+		}
+		kill(MyProcPid, SIGUSR1);
+		auto executorPID = localSession->peerPID;
+
+		// Phase 1: Write client data to ring buffer for executor
+		{
+			ARROW_ASSIGN_OR_RAISE(const auto& schema, reader->GetSchema());
+			SharedRingBufferOutputStream output(this, localSession);
+			auto options = make_ipc_options();
+			ARROW_ASSIGN_OR_RAISE(auto ipcWriter,
+			                      arrow::ipc::MakeStreamWriter(&output, schema, options));
+			while (true)
+			{
+				ARROW_ASSIGN_OR_RAISE(const auto& chunk, reader->Next());
+				if (!chunk.data)
+				{
+					break;
+				}
+				ARROW_RETURN_NOT_OK(ipcWriter->WriteRecordBatch(*(chunk.data)));
+			}
+			ARROW_RETURN_NOT_OK(ipcWriter->Close());
+			P("%s: %s: %s: kill executor: %d", Tag, tag_, tag, executorPID);
+			kill(executorPID, SIGUSR1);
+		}
+
+		// Phase 2: Wait for executor to process and write results
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			if (!conditionVariable_.wait_for(
+					lock,
+					std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
+					[&] {
+						if (localSession->errorMessage.has_value())
+						{
+							return true;
+						}
+						if (INTERRUPTS_PENDING_CONDITION())
+						{
+							return true;
+						}
+						return request->finished;
+					}))
+			{
+				return arrow::Status::IOError("timeout waiting for exchange");
+			}
+		}
+		ARROW_RETURN_NOT_OK(check_local_session_error(localSession));
+		CHECK_FOR_INTERRUPTS();
+
+		// Phase 3: Read result from ring buffer, send to client
+		// write_record_batches writes two IPC streams:
+		// 1) schema-only stream (empty batch), 2) data stream
+		// Drain the schema stream first
+		auto resultSchema = read_schema(localSession, tag);
+		if (!resultSchema.ok())
+		{
+			return resultSchema.status();
+		}
+		// Now read the data stream
+		ARROW_ASSIGN_OR_RAISE(auto resultReader, open_reader(sessionID));
+		ARROW_RETURN_NOT_OK(writer->Begin(resultReader->schema()));
+		while (true)
+		{
+			ARROW_ASSIGN_OR_RAISE(auto batch, resultReader->Next());
+			if (!batch) break;
+			ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
+		}
+		P("%s: %s: %s: done", Tag, tag_, tag);
+		return arrow::Status::OK();
+	}
+
+	// Don't use PostgreSQL API.
+	arrow::Status disconnect(uint64_t sessionID)
+	{
+		const char* tag __attribute__((unused)) = "disconnect";
+		auto request = std::make_shared<CloseSessionRequest>(sessionID);
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			closeSessionRequests_.push_back(request);
+		}
+		kill(MyProcPid, SIGUSR1);
+		// Wait for sync_sessions to clean up the session (it erases from
+		// localSessions_ and frees shared memory — we must not do that here).
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			bool closed = conditionVariable_.wait_for(
+				lock,
+				std::chrono::seconds(5),
+				[&] {
+					return localSessions_.find(sessionID) == localSessions_.end();
+				});
+			if (!closed)
+			{
+				P("%s: %s: %s: session %" PRIu64 " close timeout",
+				  Tag, tag_, tag, sessionID);
+				return arrow::Status::IOError(
+					"timeout waiting for session close");
+			}
+		}
+		P("%s: %s: %s: session %" PRIu64 " closed", Tag, tag_, tag, sessionID);
+		return arrow::Status::OK();
 	}
 
    private:
@@ -4379,7 +4916,9 @@ class Proxy : public WorkerProcessor {
 			{
 				{
 					std::lock_guard<std::mutex> lock(mutex_);
-					localSessions_.erase(localSessions_.find(session->id));
+					auto it = localSessions_.find(session->id);
+					if (it != localSessions_.end())
+						localSessions_.erase(it);
 				}
 				shared_session_data_finalize(session, area_);
 				dshash_delete_current(&sessionsStatus);
@@ -4401,7 +4940,7 @@ class Proxy : public WorkerProcessor {
 		std::unique_lock<std::mutex> lock(mutex_);
 		if (!conditionVariable_.wait_for(
 				lock,
-				std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 300),
+				std::chrono::seconds(SessionTimeout > 0 ? SessionTimeout : 86400),
 				[&] {
 					P("%s: %s: %s: %s: wait: %" PRIsize ": error: %s",
 					  Tag,
@@ -4864,6 +5403,31 @@ class FlightSQLServer : public arrow::flight::sql::FlightSqlServerBase {
 		ARROW_ASSIGN_OR_RAISE(auto sessionID, session_id(context));
 		const auto& handle = command.prepared_statement_handle;
 		return proxy_->update_prepared_statement(sessionID, handle, reader);
+	}
+
+	arrow::Status DoExchange(
+		const arrow::flight::ServerCallContext& context,
+		std::unique_ptr<arrow::flight::FlightMessageReader> reader,
+		std::unique_ptr<arrow::flight::FlightMessageWriter> writer) override
+	{
+		ARROW_ASSIGN_OR_RAISE(auto sessionID, session_id(context));
+		const auto& descriptor = reader->descriptor();
+		if (descriptor.type != arrow::flight::FlightDescriptor::CMD)
+		{
+			return arrow::Status::Invalid("DoExchange requires CMD descriptor with SQL query");
+		}
+		std::string query(descriptor.cmd);
+		return proxy_->do_exchange(sessionID, query, reader.get(), writer.get());
+	}
+
+	arrow::Result<arrow::flight::CloseSessionResult> CloseSession(
+		const arrow::flight::ServerCallContext& context,
+		const arrow::flight::CloseSessionRequest& request) override
+	{
+		ARROW_ASSIGN_OR_RAISE(auto sessionID, session_id(context));
+		ARROW_RETURN_NOT_OK(proxy_->disconnect(sessionID));
+		return arrow::flight::CloseSessionResult{
+			arrow::flight::CloseSessionStatus::kClosed};
 	}
 
    private:

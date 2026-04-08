@@ -94,27 +94,30 @@ import adbc_driver_flightsql.dbapi as flightsql
 conn = flightsql.connect(
     "grpc://127.0.0.1:15432",
     db_kwargs={"username": "postgres", "password": ""},
+    autocommit=True,
 )
 with conn.cursor() as cur:
     cur.execute("SELECT 1 AS n, 'hello' AS greeting")
     print(cur.fetch_arrow_table().to_pandas())
     #    n greeting
     # 0  1    hello
-conn.close()
 ```
 
 ### 3. Execute a Substrait Plan
+
+`cursor.execute()` accepts `bytes` as a Substrait plan:
 
 ```python
 with open("substrait_test/tpch/plans/01.proto", "rb") as f:
     plan_bytes = f.read()
 
 with conn.cursor() as cur:
-    cur.adbc_statement.set_substrait_plan(plan_bytes)
-    cur.adbc_statement.execute_query()
+    cur.execute(plan_bytes)
     table = cur.fetch_arrow_table()
     print(f"{table.num_rows} rows, {table.num_columns} cols")
     print(table.to_pandas().head())
+
+conn.close()
 ```
 
 Plans are pre-generated Substrait protobuf via [isthmus-cli][isthmus]. See `substrait_test/{tpch,tpcds}/plans/` for all TPC-H and TPC-DS plans.

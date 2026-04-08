@@ -19,7 +19,7 @@ import sys
 import concurrent.futures
 import time
 
-import pyarrow.ipc as ipc
+import adbc_driver_flightsql.dbapi as flightsql
 
 # ============================================================
 # Config
@@ -243,68 +243,56 @@ def _psql_json(sql):
 
 
 # ============================================================
-# Helpers — Flight SQL (single persistent session)
+# Helpers — Flight SQL via ADBC (single persistent connection)
 # ============================================================
 
-_flight_helper = None
+FLIGHT_URI = os.environ.get("FLIGHT_URI", "grpc://127.0.0.1:15432")
+FLIGHT_PASSWORD = os.environ.get("FLIGHT_PASSWORD", "")
+
+_adbc_conn = None
 
 
-def _get_flight_helper():
-    global _flight_helper
-    if _flight_helper is None or _flight_helper.poll() is not None:
-        helper = os.path.join(SCRIPT_DIR, "_flight_helper.py")
-        _flight_helper = subprocess.Popen(
-            [sys.executable, helper],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-    return _flight_helper
+def _get_adbc_conn():
+    global _adbc_conn
+    if _adbc_conn is None:
+        _adbc_conn = flightsql.connect(
+            FLIGHT_URI,
+            db_kwargs={
+                "username": PGUSER,
+                "password": FLIGHT_PASSWORD,
+                "adbc.flight.sql.rpc.call_header.x-flight-sql-database": PGDATABASE,
+            },
+            autocommit=True,
+        )
+    return _adbc_conn
 
 
-def _stop_flight_helper():
-    global _flight_helper
-    if _flight_helper is not None and _flight_helper.poll() is None:
-        _flight_helper.stdin.write(b"\n")
-        _flight_helper.stdin.flush()
-        _flight_helper.wait(timeout=5)
-        _flight_helper = None
+def _reset_adbc_conn():
+    global _adbc_conn
+    if _adbc_conn is not None:
+        try:
+            _adbc_conn.close()
+        except Exception:
+            pass
+        _adbc_conn = None
 
 
-def _read_exact(stream, n):
-    """Read exactly n bytes from a binary stream."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = stream.read(n - len(buf))
-        if not chunk:
-            raise RuntimeError("flight helper: unexpected EOF")
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def _flight_exec(proc, header, payload):
-    """Send command + payload, read Arrow IPC response inline."""
-    proc.stdin.write(f"{header} {len(payload)}\n".encode())
-    proc.stdin.write(payload)
-    proc.stdin.flush()
-
-    resp_line = proc.stdout.readline().decode().strip()
-    if resp_line.startswith("ERR "):
-        raise RuntimeError(resp_line[4:])
-    if not resp_line.startswith("OK "):
-        raise RuntimeError(f"unexpected response: {resp_line}")
-    nbytes = int(resp_line[3:])
-    ipc_data = _read_exact(proc.stdout, nbytes)
-    reader = ipc.open_stream(ipc_data)
-    return reader.read_all()
+def _close_adbc_conn():
+    _reset_adbc_conn()
 
 
 def flight_exec_sql(sql):
-    proc = _get_flight_helper()
-    return _flight_exec(proc, "SQL", sql.encode("utf-8"))
+    conn = _get_adbc_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return cur.fetch_arrow_table()
 
 
 def flight_exec_substrait(plan_bytes):
-    proc = _get_flight_helper()
-    return _flight_exec(proc, "PLAN", plan_bytes)
+    conn = _get_adbc_conn()
+    with conn.cursor() as cur:
+        cur.execute(plan_bytes)
+        return cur.fetch_arrow_table()
 
 
 # ============================================================
@@ -536,6 +524,7 @@ def run_query(bench, qlabel, run=5, explain=0, explain_dir=None):
             substrait_time_s = time.monotonic() - t
         except Exception as e:
             substrait_time_s = time.monotonic() - t
+            _reset_adbc_conn()
             print(f"FAIL (adapter error: {e}) sub={substrait_time_s:.3f}s")
             _results["fail"] += 1
             _timing_log.append((qlabel, 0, "FAIL",
@@ -670,6 +659,8 @@ def main():
     else:
         run = 5
 
+    psql_run("ALTER SYSTEM SET arrow_flight_sql.session_timeout = -1; SELECT pg_reload_conf();")
+
     if args.explain & 3:
         psql_run("ALTER SYSTEM SET arrow_flight_sql.explain = 2; SELECT pg_reload_conf();")
 
@@ -697,7 +688,9 @@ def main():
     if args.explain & 3:
         psql_run("ALTER SYSTEM RESET arrow_flight_sql.explain; SELECT pg_reload_conf();")
 
-    _stop_flight_helper()
+    psql_run("ALTER SYSTEM RESET arrow_flight_sql.session_timeout; SELECT pg_reload_conf();")
+
+    _close_adbc_conn()
 
     p, f, s, e = _results["pass"], _results["fail"], \
                   _results["skip"], _results["error"]
